@@ -504,10 +504,40 @@ public abstract class BaseDownloadService : IDownloadService
         Logger.LogInformation("Starting background download for album {AlbumId} (excluding track {TrackId})", 
             albumExternalId, excludeTrackExternalId);
 
-        var album = await MetadataService.GetAlbumAsync(ProviderName, albumExternalId);
+        // Resolving an album's tracklist crosses the network (Deezer), so a blip
+        // returns a valid Album object carrying zero songs. Untreated, that reads
+        // as "album fully downloaded" and the star silently does nothing — the
+        // user's only clue is that no files appear, and re-starring is the only
+        // recovery. Retry a few times before believing an empty tracklist.
+        const int maxResolveAttempts = 3;
+        Album? album = null;
+        for (var attempt = 1; attempt <= maxResolveAttempts; attempt++)
+        {
+            album = await MetadataService.GetAlbumAsync(ProviderName, albumExternalId);
+            if (album is { Songs.Count: > 0 }) break;
+
+            if (attempt < maxResolveAttempts)
+            {
+                Logger.LogWarning(
+                    "Album {AlbumId} resolved to {Count} track(s) on attempt {N}/{Max}; retrying",
+                    albumExternalId, album?.Songs.Count ?? 0, attempt, maxResolveAttempts);
+                await Task.Delay(TimeSpan.FromSeconds(2 * attempt));
+            }
+        }
+
         if (album == null)
         {
             Logger.LogWarning("Album {AlbumId} not found, cannot download remaining tracks", albumExternalId);
+            return;
+        }
+
+        if (album.Songs.Count == 0)
+        {
+            // Loud, because this is indistinguishable from success in every other log line.
+            Logger.LogError(
+                "Album '{Title}' ({AlbumId}) has an empty tracklist after {Max} attempts — nothing will be " +
+                "downloaded. This is usually a transient metadata-provider failure; star the album again to retry.",
+                album.Title, albumExternalId, maxResolveAttempts);
             return;
         }
 

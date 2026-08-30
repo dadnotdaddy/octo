@@ -258,6 +258,100 @@ public class SoulseekClient
     }
 
     /// <summary>
+    /// Lists one directory from a specific peer's share.
+    ///
+    /// Search is the wrong tool for "the rest of this album": Soulseek's global
+    /// search misses plenty of files that are demonstrably sitting in a folder we
+    /// already downloaded from (a peer's indexer may not tokenize the title, the
+    /// distributed search may simply not reach us). Once a peer has given us one
+    /// track we know exactly where the album lives, so ask them directly.
+    ///
+    /// Returns an empty list on any failure — this is an optimization path, and
+    /// the caller still has global search to fall back on.
+    /// </summary>
+    public async Task<List<SoulseekFileHit>> BrowseDirectoryAsync(string username, string directory, CancellationToken ct = default)
+    {
+        var hits = new List<SoulseekFileHit>();
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(directory)) return hits;
+
+        try
+        {
+            var body = JsonSerializer.Serialize(new { directory });
+            using var resp = await SendAsync(
+                HttpMethod.Post,
+                $"{Base}/api/v0/users/{Uri.EscapeDataString(username)}/directory",
+                new StringContent(body, Encoding.UTF8, "application/json"),
+                ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("slskd browse of '{Dir}' from {User} failed: HTTP {Code}",
+                    directory, username, (int)resp.StatusCode);
+                return hits;
+            }
+
+            var json = await resp.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            // slskd returns a single directory object: { name, fileCount, files: [...] }.
+            // Some versions wrap it in a one-element array instead, so accept either
+            // rather than silently returning nothing on a shape we didn't expect.
+            var container = root.ValueKind == JsonValueKind.Array
+                ? (root.GetArrayLength() > 0 ? root[0] : default)
+                : root;
+
+            if (container.ValueKind != JsonValueKind.Object
+                || !container.TryGetProperty("files", out var filesEl)
+                || filesEl.ValueKind != JsonValueKind.Array)
+            {
+                _logger.LogDebug("slskd browse of '{Dir}' from {User}: no file list in response", directory, username);
+                return hits;
+            }
+
+            // Browse results carry no per-peer speed/queue info, so leave those null;
+            // ranking treats a browse hit as "already-proven peer" via the caller.
+            foreach (var file in filesEl.EnumerateArray())
+            {
+                var filename = file.TryGetProperty("filename", out var fnEl) ? fnEl.GetString() : null;
+                if (string.IsNullOrWhiteSpace(filename)) continue;
+
+                long size = file.TryGetProperty("size", out var szEl) && szEl.ValueKind == JsonValueKind.Number
+                    ? szEl.GetInt64()
+                    : 0;
+                var ext = file.TryGetProperty("extension", out var exEl) ? exEl.GetString() : null;
+
+                // A browse response returns filenames relative to the directory on some
+                // slskd versions and fully-qualified on others. Enqueue needs the full
+                // path the peer knows, so re-qualify anything that looks relative.
+                var fullName = filename.Contains('\\') || filename.Contains('/')
+                    ? filename
+                    : $"{directory.TrimEnd('\\', '/')}\\{filename}";
+
+                hits.Add(new SoulseekFileHit
+                {
+                    Username = username,
+                    Filename = fullName,
+                    Size = size,
+                    BitRate = file.TryGetProperty("bitRate", out var brEl) && brEl.ValueKind == JsonValueKind.Number ? brEl.GetInt32() : null,
+                    SampleRate = file.TryGetProperty("sampleRate", out var srEl) && srEl.ValueKind == JsonValueKind.Number ? srEl.GetInt32() : null,
+                    BitDepth = file.TryGetProperty("bitDepth", out var bdEl) && bdEl.ValueKind == JsonValueKind.Number ? bdEl.GetInt32() : null,
+                    Length = file.TryGetProperty("length", out var lenEl) && lenEl.ValueKind == JsonValueKind.Number ? lenEl.GetInt32() : null,
+                    Extension = (ext ?? Path.GetExtension(fullName).TrimStart('.')).ToLowerInvariant(),
+                    UploadSpeed = null,
+                    QueueLength = null
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("slskd browse of '{Dir}' from {User} threw: {Msg}", directory, username, ex.Message);
+        }
+
+        return hits;
+    }
+
+    /// <summary>
     /// Enqueues a download from a specific peer. Returns when the request is accepted by slskd
     /// (not when the file is fully transferred — caller polls for that).
     /// </summary>

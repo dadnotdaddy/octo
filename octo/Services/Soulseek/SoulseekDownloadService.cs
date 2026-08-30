@@ -35,10 +35,29 @@ public class SoulseekDownloadService : BaseDownloadService
     // almost always share a whole album as one folder, so once ANY track in an
     // album lands from a given peer, every subsequent track for that same album
     // tries that SAME peer's copy first (see RankCandidates). This key ->
-    // username cache is what remembers the winning peer between tracks.
+    // (username, directory) cache is what remembers the winning peer between
+    // tracks. The DIRECTORY matters as much as the peer: global search demonstrably
+    // fails to surface files that are sitting in a folder we already pulled from,
+    // so when search comes up empty we browse that folder directly rather than
+    // giving up on the track.
     // Process-lifetime only (an album finishes within one background download
     // run), no eviction needed.
-    private readonly ConcurrentDictionary<string, string> _albumPreferredPeer = new();
+    private readonly ConcurrentDictionary<string, AlbumSource> _albumPreferredPeer = new();
+
+    /// <summary>The peer and share folder a previous track of this album came from.</summary>
+    private sealed record AlbumSource(string Username, string Directory);
+
+    /// <summary>
+    /// The peer-side folder a file lives in. Soulseek paths are Windows-style
+    /// (backslash) in practice, but peers on other platforms send forward slashes,
+    /// so handle both rather than assuming.
+    /// </summary>
+    private static string? PeerDirectoryOf(string filename)
+    {
+        if (string.IsNullOrEmpty(filename)) return null;
+        var idx = filename.LastIndexOfAny(new[] { '\\', '/' });
+        return idx > 0 ? filename[..idx] : null;
+    }
 
     protected override string ProviderName => SoulseekMetadataService.ProviderName;
 
@@ -285,14 +304,15 @@ public class SoulseekDownloadService : BaseDownloadService
         var primaryQuery = $"{routing.Artist} {cleanTitle}".Trim();
 
         var albumKey = AlbumKey(routing);
-        var preferredPeer = albumKey != null && _albumPreferredPeer.TryGetValue(albumKey, out var pp) ? pp : null;
-        if (preferredPeer != null)
-            Logger.LogInformation("Album '{Album}' has a preferred peer from an earlier track: {User}", routing.Album, preferredPeer);
+        var source = albumKey != null && _albumPreferredPeer.TryGetValue(albumKey, out var pp) ? pp : null;
+        if (source != null)
+            Logger.LogInformation("Album '{Album}' has a preferred peer from an earlier track: {User} ({Dir})",
+                routing.Album, source.Username, source.Directory);
 
         Logger.LogInformation("Soulseek search-for-star: '{Query}'", primaryQuery);
         var hits = await _slskd.SearchAsync(primaryQuery, _settings.MinFileSizeBytes > 0 ? 30 : 10, cancellationToken);
 
-        var ranked = RankCandidates(hits, routing.Title!, preferredPeer);
+        var ranked = RankCandidates(hits, routing, source?.Username);
 
         // Fallback search: if the artist+title combo returned nothing usable,
         // try with just the cleaned title. Catches cases where the Last.fm
@@ -302,7 +322,24 @@ public class SoulseekDownloadService : BaseDownloadService
         {
             Logger.LogInformation("Soulseek primary query returned no usable hits; retrying with title-only");
             hits = await _slskd.SearchAsync(cleanTitle, _settings.MinFileSizeBytes > 0 ? 30 : 10, cancellationToken);
-            ranked = RankCandidates(hits, routing.Title!, preferredPeer);
+            ranked = RankCandidates(hits, routing, source?.Username);
+        }
+
+        // Last resort for album tracks: ask the peer that gave us an earlier track
+        // to list the folder it came from. Uploaders share albums as whole folders,
+        // so the track global search couldn't find is very often sitting right
+        // there — this is what turns a 10-of-14 album into a complete one.
+        if (ranked.Count == 0 && source != null)
+        {
+            Logger.LogInformation(
+                "Soulseek search found nothing for '{Title}'; browsing {User}'s album folder '{Dir}' directly",
+                routing.Title, source.Username, source.Directory);
+
+            var browsed = await _slskd.BrowseDirectoryAsync(source.Username, source.Directory, cancellationToken);
+            ranked = RankCandidates(browsed, routing, source.Username);
+
+            Logger.LogInformation("Browse of '{Dir}' returned {Total} file(s), {Ranked} usable for '{Title}'",
+                source.Directory, browsed.Count, ranked.Count, routing.Title);
         }
 
         if (ranked.Count == 0)
@@ -349,10 +386,28 @@ public class SoulseekDownloadService : BaseDownloadService
                 Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}): {Path}",
                     attemptIdx, state, localPath);
 
-                // Remember this peer for the rest of the album so later tracks try
-                // them first instead of landing on an unrelated release/rip.
-                if (albumKey != null)
-                    _albumPreferredPeer[albumKey] = hit.Username;
+                // Visibility into cross-album picks. The metadata normalize pass
+                // rewrites Album/Year afterwards, so a track pulled from the wrong
+                // record ends up looking perfectly correct in the library — this
+                // line is the only place that discrepancy is ever observable.
+                var pathNamesAlbum = string.IsNullOrWhiteSpace(routing.Album)
+                                     || PathMentions(hit.Filename, routing.Album);
+                if (!pathNamesAlbum)
+                {
+                    Logger.LogWarning(
+                        "Soulseek: '{Title}' for album '{Album}' came from a path that does not mention that album: {File}",
+                        routing.Title, routing.Album, hit.Filename);
+                }
+
+                // Remember this peer AND the folder for the rest of the album, so later
+                // tracks try the same release first and can browse it when search fails.
+                //
+                // Only when the folder actually looks like this album: caching a folder
+                // we already suspect is the wrong record would aim every later browse
+                // fallback at it, turning one bad pick into a whole bad album. Keep the
+                // earlier, better source instead.
+                if (albumKey != null && pathNamesAlbum && PeerDirectoryOf(hit.Filename) is { } dir)
+                    _albumPreferredPeer[albumKey] = new AlbumSource(hit.Username, dir);
 
                 return localPath;
             }
@@ -526,17 +581,79 @@ public class SoulseekDownloadService : BaseDownloadService
     // matching the rest of the album beats a marginally faster stranger. It still has
     // to pass the same extension/size/title filters as everyone else, so a peer that
     // simply doesn't have this particular track is skipped, not force-included.
-    private List<SoulseekFileHit> RankCandidates(List<SoulseekFileHit> hits, string title, string? preferredPeer = null)
-        => hits
+    /// <summary>
+    /// Filter to plausible files and order them best-first.
+    ///
+    /// Ordering, not filtering, on artist/album: a peer whose folder layout doesn't
+    /// name the album is common and perfectly fine, so demoting those keeps the
+    /// track downloadable while making a same-titled song from an unrelated record
+    /// the last resort instead of the first pick. Filtering on it would trade
+    /// wrong-album tracks for missing ones, which is a worse deal.
+    /// </summary>
+    private List<SoulseekFileHit> RankCandidates(List<SoulseekFileHit> hits, SoulseekRouting routing, string? preferredPeer = null)
+    {
+        var title = routing.Title ?? "";
+        var album = routing.Album;
+        var artist = routing.Artist;
+
+        return hits
             .Where(h => string.Equals(h.Extension, _settings.PreferredExtension, StringComparison.OrdinalIgnoreCase))
             .Where(h => h.Size >= _settings.MinFileSizeBytes)
             .Where(h => FilenamePlausiblyMatchesTitle(h.Filename, title))
-            .OrderBy(h => preferredPeer != null && string.Equals(h.Username, preferredPeer, StringComparison.Ordinal) ? 0 : 1)
+            // Album match outranks peer affinity, deliberately. Peer affinity exists to
+            // keep one album's tracks from one consistent rip — if the proven peer's
+            // file isn't from this album at all, that rationale doesn't apply, and
+            // preferring it is exactly how "Bussdown" arrived from a Freddie Gibbs
+            // record via the same peer that had the right album elsewhere.
+            .OrderBy(h => PathMentions(h.Filename, album) ? 0 : 1)
+            .ThenBy(h => preferredPeer != null && string.Equals(h.Username, preferredPeer, StringComparison.Ordinal) ? 0 : 1)
+            .ThenBy(h => PathMentions(h.Filename, artist) ? 0 : 1)
             .ThenBy(h => h.QueueLength ?? int.MaxValue)
             .ThenByDescending(h => h.UploadSpeed ?? 0)
             .ThenByDescending(h => h.Size)
             .Take(MaxPeerAttempts)
             .ToList();
+    }
+
+    /// <summary>
+    /// Does this peer path mention the given album/artist? Compares on letters and
+    /// digits only, so "ZABA (2014)" matches "ZABA (Deluxe)" and punctuation or
+    /// spacing differences between share layouts don't cause false negatives.
+    /// A missing needle is "no opinion" (false) rather than a match.
+    /// </summary>
+    private static bool PathMentions(string? path, string? needle)
+    {
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(needle)) return false;
+
+        static string Fold(string s)
+        {
+            var sb = new System.Text.StringBuilder(s.Length);
+            foreach (var c in s)
+                if (char.IsLetterOrDigit(c)) sb.Append(char.ToLowerInvariant(c));
+            return sb.ToString();
+        }
+
+        var haystack = Fold(path);
+        var folded = Fold(needle);
+
+        // Very short folded names ("Go", "5200") match almost anything, so they'd
+        // make this signal noise rather than evidence. Abstain instead.
+        if (folded.Length < 4) return false;
+
+        if (haystack.Contains(folded, StringComparison.Ordinal)) return true;
+
+        // An album title often carries an edition suffix the sharer's folder omits
+        // ("ZABA (Deluxe)" vs ".../ZABA (2014)/"). Retry on the part before the
+        // first parenthetical so those still count as a match.
+        var paren = needle.IndexOf('(');
+        if (paren > 0)
+        {
+            var stem = Fold(needle[..paren]);
+            if (stem.Length >= 4 && haystack.Contains(stem, StringComparison.Ordinal)) return true;
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Light sanity check: does the filename contain at least one significant
