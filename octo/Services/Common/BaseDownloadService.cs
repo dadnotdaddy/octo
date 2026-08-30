@@ -688,7 +688,7 @@ public abstract class BaseDownloadService : IDownloadService
                 var composers = tagFile.Tag.Composers;
                 var comment = tagFile.Tag.Comment;
 
-                tagFile.Tag.Clear();
+                StripAllTags(tagFile);
 
                 if (!string.IsNullOrEmpty(title)) tagFile.Tag.Title = title;
                 if (performers is { Length: > 0 }) tagFile.Tag.Performers = performers;
@@ -727,6 +727,40 @@ public abstract class BaseDownloadService : IDownloadService
         }
 
         Logger.LogInformation("Album normalize: completed consistency pass for '{Album}'", detail.Title);
+    }
+
+    /// <summary>
+    /// Remove every tag a file carries, so what gets written afterwards is the
+    /// complete contents rather than a partial overlay on someone else's rip.
+    ///
+    /// <c>Tag.Clear()</c> alone is NOT enough on FLAC. It clears the properties
+    /// TagLib models and leaves every unmodelled Xiph comment in place — BARCODE,
+    /// RELEASECOUNTRY, MUSICBRAINZ_ALBUMSTATUS, ALBUMARTISTS_SORT, and most
+    /// damagingly MUSICBRAINZ_ALBUMCOMMENT, which Navidrome reads as an album
+    /// "version". Two tracks of a 15-track album carrying ALBUMCOMMENT=deluxe
+    /// while the other 13 did not split it into "ZABA (Deluxe)" (13 tracks) and
+    /// "ZABA (Deluxe) (deluxe)" (2) even though album, artist, year and genre
+    /// were byte-identical across all fifteen.
+    ///
+    /// Rips from different sharers never agree on these extras, so anything left
+    /// behind is a fragmentation risk. Wipe the lot and rebuild from one lookup.
+    /// </summary>
+    private static void StripAllTags(TagLib.File tagFile)
+    {
+        tagFile.Tag.Clear();
+
+        if (tagFile.GetTag(TagTypes.Xiph) is TagLib.Ogg.XiphComment xiph)
+        {
+            // Materialize first: RemoveField mutates the collection being enumerated.
+            foreach (var field in System.Linq.Enumerable.ToArray(xiph))
+                xiph.RemoveField(field);
+
+            // A FLAC can also carry legacy ID3/APE blocks that Navidrome may read in
+            // preference to Xiph. Only safe to drop wholesale because Xiph is this
+            // file's primary tag — doing it on an MP3 would delete what we're about
+            // to write.
+            tagFile.RemoveTags(TagTypes.Id3v1 | TagTypes.Id3v2 | TagTypes.Ape);
+        }
     }
 
     #endregion
