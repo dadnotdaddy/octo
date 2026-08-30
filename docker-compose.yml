@@ -38,6 +38,13 @@ services:
       # Where downloaded FLACs land (bind-mount below)
       Library__DownloadPath: /music
 
+      # Where slskd drops finished transfers, before Octo files them into the
+      # library. Deliberately OUTSIDE /music: when slskd wrote straight into the
+      # library, Navidrome would index a file at the peer's arbitrary folder path
+      # before Octo relocated it, leaving a dead row behind and flashing junk
+      # albums ("ZABA (2014)", "Punken (1)") into clients mid-download.
+      Library__StagingPath: /staging
+
       # ----- yt-dlp shim sidecar (internal stream-preview source) -----
       YouTube__ShimUrl: http://yt-dlp-shim:8080
 
@@ -57,6 +64,7 @@ services:
       LastFm__RadioCacheDurationHours: ${LASTFM_RADIO_CACHE_HOURS:-24}
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music
+      - ${STAGING_PATH:-./staging}:/staging
       # Editable settings file — admin UI writes here, ASP.NET hot-reloads on
       # change. Bind-mounted to host so values survive `docker compose up`.
       - ./octo-config:/app/config
@@ -121,7 +129,9 @@ services:
 
   # Soulseek client (slskd). Web UI on 5030, peer port 50300.
   # State (config, db, downloads-in-progress) persisted to ./slskd-state so the
-  # account survives recreate. Final FLACs land in the same /music as Octo.
+  # account survives recreate. Finished transfers land in /staging, which Octo
+  # then files into the library — slskd never writes into /music itself.
+  # /music is mounted read-only purely so the library can be SHARED for seeding.
   slskd:
     image: slskd/slskd:latest
     container_name: slskd
@@ -130,14 +140,20 @@ services:
     network_mode: "container:gluetun"
     environment:
       SLSKD_REMOTE_CONFIGURATION: "true"
-      SLSKD_DOWNLOADS_DIR: /music
+      SLSKD_DOWNLOADS_DIR: /staging
+      # Shared dirs are declared in slskd-state/slskd.yml (shares.directories),
+      # not here — one source of truth. The share index has retention: ~ (never
+      # self-refreshes), so cron re-scans it nightly: slskd-rescan-shares.sh.
       SLSKD_SLSK_USERNAME: ${SLSKD_SOULSEEK_USERNAME:-}
       SLSKD_SLSK_PASSWORD: ${SLSKD_SOULSEEK_PASSWORD:-}
       SLSKD_USERNAME: ${SLSKD_USERNAME:-slskd}
       SLSKD_PASSWORD: ${SLSKD_PASSWORD:-slskd}
     volumes:
       - ./slskd-state:/app
-      - ${DOWNLOAD_PATH:-./downloads}:/music
+      # Read-only: slskd shares the library for seeding but must never write to
+      # it. Downloads go to /staging instead.
+      - ${DOWNLOAD_PATH:-./downloads}:/music:ro
+      - ${STAGING_PATH:-./staging}:/staging
 
 volumes:
   ytdlp-cache:

@@ -97,7 +97,16 @@ public class SoulseekDownloadService : BaseDownloadService
         _deezer = deezer;
         _httpClient = httpClientFactory.CreateClient();
         _httpClient.Timeout = TimeSpan.FromMinutes(10);
+        _stagingPath = configuration["Library:StagingPath"] ?? "/staging";
     }
+
+    // Where slskd drops finished transfers, kept OUTSIDE the Navidrome library.
+    // When slskd wrote straight into /music, Navidrome would index a file at the
+    // peer's arbitrary folder path before we relocated it — leaving a dead row
+    // pointing at the old path and briefly showing junk albums like "ZABA (2014)"
+    // or "Punken (1)" in the client. Nothing enters the library now until it is
+    // complete and correctly placed.
+    private readonly string _stagingPath;
 
     public override Task<bool> IsAvailableAsync() => _slskd.IsReachableAsync();
 
@@ -464,14 +473,33 @@ public class SoulseekDownloadService : BaseDownloadService
             // freshly-downloaded copy.
             if (IOFile.Exists(targetPath)) IOFile.Delete(targetPath);
 
-            IOFile.Move(currentPath, targetPath);
+            try
+            {
+                IOFile.Move(currentPath, targetPath);
+            }
+            catch (IOException)
+            {
+                // Staging and the library can sit on different filesystems, where a
+                // rename is not possible. Copy then delete instead of failing: the
+                // caller's fallback would leave the file in staging, outside the
+                // library, where Navidrome would never see it.
+                IOFile.Copy(currentPath, targetPath, overwrite: true);
+                IOFile.Delete(currentPath);
+            }
+
             Logger.LogInformation("Repositioned download to {Layout}: {From} -> {To}",
                 SubsonicSettings.FolderStructure, currentPath, targetPath);
 
             // Clean up any now-empty parent directories slskd dumped into
-            // (e.g. "/music/Return of the Mack/" if it's empty after we moved
-            // the only file out). Don't recurse past DownloadPath.
-            TryRemoveEmptyParents(Path.GetDirectoryName(currentPath), DownloadPath);
+            // (e.g. "<staging>/Return of the Mack/" if it's empty after we moved the
+            // only file out). Bound the walk by whichever root the file actually came
+            // from — passing only DownloadPath would stop the cleanup dead for staged
+            // files and leave the peer's folder tree behind after every download.
+            var sourceRoot = !string.IsNullOrEmpty(_stagingPath)
+                             && currentPath.StartsWith(_stagingPath, StringComparison.Ordinal)
+                ? _stagingPath
+                : DownloadPath;
+            TryRemoveEmptyParents(Path.GetDirectoryName(currentPath), sourceRoot);
 
             return targetPath;
         }
@@ -685,8 +713,12 @@ public class SoulseekDownloadService : BaseDownloadService
         var leaf = segments[^1];
         var parent = segments.Length >= 2 ? segments[^2] : null;
 
+        // Staging first: that's where slskd puts finished transfers now. The library
+        // roots stay in the list so a file downloaded under the old configuration
+        // (straight into /music) is still found after an upgrade.
         var roots = new List<string>();
-        if (!string.IsNullOrEmpty(DownloadPath)) roots.Add(DownloadPath);
+        if (!string.IsNullOrEmpty(_stagingPath)) roots.Add(_stagingPath);
+        if (!string.IsNullOrEmpty(DownloadPath) && !roots.Contains(DownloadPath)) roots.Add(DownloadPath);
         if (!roots.Contains("/music")) roots.Add("/music");
 
         foreach (var root in roots)
