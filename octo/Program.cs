@@ -81,8 +81,12 @@ builder.Services.AddSingleton<Octo.Services.Metadata.DeezerMetadataService>();
 builder.Services.AddSingleton<IMusicMetadataService, SoulseekMetadataService>();
 builder.Services.AddSingleton<IDownloadService, SoulseekDownloadService>();
 
-builder.Services.AddHttpClient<LastFmService>();
+// Singleton (not the transient the typed-client overload would give us) because
+// LastFmService holds the similar-tracks cache — a per-request instance would
+// throw that cache away on every call. AddHttpClient() above already registers a
+// pooled default HttpClient, which is what the constructor resolves.
 builder.Services.AddSingleton<LastFmService>();
+builder.Services.AddSingleton<Octo.Services.LastFm.ListenBrainzSimilarTracksService>();
 
 builder.Services.AddSingleton<IStartupValidator, SubsonicStartupValidator>();
 builder.Services.AddSingleton<IStartupValidator, SoulseekStartupValidator>();
@@ -94,6 +98,8 @@ builder.Services.AddSingleton<Octo.Services.CoverArt.CoverArtService>();
 // Cover-art sources, registered in fallback order. The aggregator pulls them
 // all out via IEnumerable<ICoverArtSource> and queries them sequentially —
 // adding/removing a source is a one-line registration change here.
+builder.Services.AddSingleton<Octo.Services.CoverArt.ICoverArtSource, Octo.Services.CoverArt.FanartCoverArtLookup>();
+builder.Services.AddSingleton<Octo.Services.CoverArt.ICoverArtSource, Octo.Services.CoverArt.TheAudioDbCoverArtLookup>();
 builder.Services.AddSingleton<Octo.Services.CoverArt.ICoverArtSource, Octo.Services.CoverArt.DeezerCoverArtLookup>();
 builder.Services.AddSingleton<Octo.Services.CoverArt.ICoverArtSource, Octo.Services.CoverArt.ITunesCoverArtLookup>();
 builder.Services.AddSingleton<Octo.Services.CoverArt.ICoverArtSource, Octo.Services.CoverArt.LastFmCoverArtLookup>();
@@ -152,8 +158,15 @@ _ = Task.Run(async () =>
     catch (Exception ex) { log.LogWarning("First-run server auto-detect failed: {Msg}", ex.Message); }
 
     // Detect the music folder from whatever URL we now have (configured or adopted).
-    await sp.GetRequiredService<Octo.Services.Subsonic.NavidromeIdentityService>()
-        .DetectMusicFolderAsync(force: true);
+    // Guarded like the block above: this runs in a detached task, so an escaping
+    // exception would be an unobserved TaskException — silently lost, and fatal on
+    // some GC/unobserved-exception policies. Best-effort means best-effort.
+    try
+    {
+        await sp.GetRequiredService<Octo.Services.Subsonic.NavidromeIdentityService>()
+            .DetectMusicFolderAsync(force: true);
+    }
+    catch (Exception ex) { log.LogWarning("First-run music-folder detect failed: {Msg}", ex.Message); }
 });
 
 app.UseExceptionHandler(_ => { });

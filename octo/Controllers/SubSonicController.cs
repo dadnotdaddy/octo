@@ -33,12 +33,17 @@ public class SubsonicController : ControllerBase
     private readonly SubsonicProxyService _proxyService;
     private readonly PlaylistSyncService? _playlistSyncService;
     private readonly LastFmService? _lastFmService;
+    private readonly ListenBrainzSimilarTracksService? _listenBrainzService;
     private readonly LastFmSettings _lastFmSettings;
     private readonly CoverArtService? _coverArtService;
     private readonly CoverArtAggregator? _coverArtAggregator;
     private readonly ExternalIdRegistry _idRegistry;
     private readonly RadioQueueStore _radioQueueStore;
     private readonly NavidromeIdentityService _navIdentity;
+    // Factory, not a held HttpClient: cover-art fetches hit arbitrary third-party
+    // CDNs, and a raw `new HttpClient()` per request leaks its socket into
+    // TIME_WAIT (the classic handler-per-request exhaustion bug).
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<SubsonicController> _logger;
 
     public SubsonicController(
@@ -53,10 +58,12 @@ public class SubsonicController : ControllerBase
         ExternalIdRegistry idRegistry,
         RadioQueueStore radioQueueStore,
         NavidromeIdentityService navIdentity,
+        IHttpClientFactory httpClientFactory,
         ILogger<SubsonicController> logger,
         IOptions<LastFmSettings> lastFmSettings,
         PlaylistSyncService? playlistSyncService = null,
         LastFmService? lastFmService = null,
+        ListenBrainzSimilarTracksService? listenBrainzService = null,
         CoverArtService? coverArtService = null,
         CoverArtAggregator? coverArtAggregator = null)
     {
@@ -71,8 +78,10 @@ public class SubsonicController : ControllerBase
         _idRegistry = idRegistry;
         _radioQueueStore = radioQueueStore;
         _navIdentity = navIdentity;
+        _httpClientFactory = httpClientFactory;
         _playlistSyncService = playlistSyncService;
         _lastFmService = lastFmService;
+        _listenBrainzService = listenBrainzService;
         _lastFmSettings = lastFmSettings.Value;
         _coverArtService = coverArtService;
         _coverArtAggregator = coverArtAggregator;
@@ -139,89 +148,6 @@ public class SubsonicController : ControllerBase
         };
     }
 
-    // Old getRandomSongs hijack — DISABLED, kept for reference only.
-    private async Task<IActionResult> GetRandomSongs_DISABLED_HIJACK()
-    {
-        var parameters = await ExtractAllParameters();
-        var format = parameters.GetValueOrDefault("f", "xml");
-        var size = int.TryParse(parameters.GetValueOrDefault("size", "10"), out var n) ? n : 10;
-
-        // 1. Ask Navidrome for ONE random song to use as a Last.fm seed.
-        string? seedArtist = null;
-        string? seedTitle = null;
-        try
-        {
-            var seedParams = new Dictionary<string, string>(parameters) { ["size"] = "1", ["f"] = "json" };
-            var seedResult = await _proxyService.RelayAsync("rest/getRandomSongs", seedParams);
-            using var seedDoc = JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(seedResult.Body));
-            if (seedDoc.RootElement.TryGetProperty("subsonic-response", out var seedResp) &&
-                seedResp.TryGetProperty("randomSongs", out var rs) &&
-                rs.TryGetProperty("song", out var seedSongs) &&
-                seedSongs.ValueKind == JsonValueKind.Array &&
-                seedSongs.GetArrayLength() > 0)
-            {
-                var seed = seedSongs[0];
-                seedArtist = seed.TryGetProperty("artist", out var a) ? a.GetString() : null;
-                seedTitle = seed.TryGetProperty("title", out var t) ? t.GetString() : null;
-                // Collaboration tracks tagged "ArtistA • ArtistB" / "ArtistA & ArtistB" /
-                // "ArtistA feat. ArtistB" don't exist in Last.fm as compound artists.
-                // Strip to the primary artist so we get back useful similars.
-                seedArtist = NormalizeSeedArtist(seedArtist);
-                seedTitle  = NormalizeSeedTitle(seedTitle);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "getRandomSongs: seed fetch from Navidrome failed; passing through");
-        }
-
-        // 2. If we have a seed and Last.fm is wired up, build the radio queue.
-        if (!string.IsNullOrEmpty(seedArtist) && !string.IsNullOrEmpty(seedTitle) && _lastFmService != null)
-        {
-            try
-            {
-                _logger.LogInformation("getRandomSongs radio seed: {Artist} - {Title}", seedArtist, seedTitle);
-
-                // Cap resolution count: Arpeggio's HTTP client times out around 20-30s. Each
-                // YouTube search costs 2-8s through the shim's gate, so we need a tight bound.
-                var resolveCap = Math.Min(size, 6);
-                var similar = await _lastFmService.GetSimilarTracksAsync(seedArtist!, seedTitle!, resolveCap);
-                if (similar.Count > 0)
-                {
-                    var resolveTasks = similar.Take(resolveCap).Select(async t =>
-                    {
-                        try
-                        {
-                            var hits = await _metadataService.SearchSongsByArtistTitleAsync(t.Artist, t.Title, 1, t.Duration);
-                            return hits.Count > 0 ? hits[0] : null;
-                        }
-                        catch { return null; }
-                    });
-                    var resolved = (await Task.WhenAll(resolveTasks)).Where(s => s != null).Cast<Song>().ToList();
-
-                    if (resolved.Count > 0)
-                    {
-                        _logger.LogInformation("getRandomSongs radio: resolved {Count}/{Total} similar tracks via YouTube",
-                            resolved.Count, similar.Count);
-                        return BuildRandomSongsResponse(format, resolved);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "getRandomSongs radio path failed, falling back to Navidrome random");
-            }
-        }
-
-        // 3. Fallback: just proxy the original request to Navidrome.
-        var passthrough = await _proxyService.RelayAsync("rest/getRandomSongs", parameters);
-        return new ContentResult
-        {
-            Content = System.Text.Encoding.UTF8.GetString(passthrough.Body),
-            ContentType = passthrough.ContentType ?? "application/json",
-            StatusCode = 200
-        };
-    }
 
     private static string? NormalizeSeedArtist(string? artist)
     {
@@ -296,6 +222,16 @@ public class SubsonicController : ControllerBase
 
         var cleanQuery = query.Trim().Trim('"');
 
+        // Narjo sends this on every keystroke of its typeahead search to ask
+        // for a fast, local-feeling response -- skip the yt-dlp-backed
+        // YouTube duration/prewarm work (each a real subprocess spawn) that
+        // would otherwise queue up behind yt-dlp-shim's concurrency cap as
+        // the user keeps typing. Deezer-based enrichment (HTTP only, no
+        // subprocess) still runs so results still show art/year/duration.
+        var skipExternalHeavyWork = string.Equals(
+            parameters.GetValueOrDefault("narjoSkipExternal", "false"),
+            "true", StringComparison.OrdinalIgnoreCase);
+
         if (string.IsNullOrWhiteSpace(cleanQuery))
         {
             try
@@ -345,13 +281,23 @@ public class SubsonicController : ControllerBase
             ? _metadataService.SearchAlbumsAsync(cleanQuery, Math.Min(requestedAlbums, 20))
             : Task.FromResult(new List<Album>());
 
-        var externalSongs = await BuildExternalSearchResultsAsync(cleanQuery, externalTarget);
+        // Same idea as albums: external artist discovery costs no serial latency
+        // since it runs concurrently with the song/album fan-out, and needs no
+        // Last.fm key (Deezer's artist search is keyless).
+        var artistTask = requestedArtists > 0
+            ? _metadataService.SearchArtistsAsync(cleanQuery, Math.Min(requestedArtists, 20))
+            : Task.FromResult(new List<Artist>());
+
+        var externalSongs = await BuildExternalSearchResultsAsync(cleanQuery, externalTarget, prewarm: !skipExternalHeavyWork);
 
         // Album/art/year from Deezer (fast), then the ACCURATE duration for the top
         // of the list from the real YouTube video (so the scrub bar matches the
         // audio and the client advances correctly). Bounded + cached.
         await _metadataService.EnrichExternalSongsAsync(externalSongs);
-        await _metadataService.ResolveTopDurationsAsync(externalSongs);
+        if (!skipExternalHeavyWork)
+        {
+            await _metadataService.ResolveTopDurationsAsync(externalSongs);
+        }
 
         // Local pass-through. Albums/artists always get the full requested counts;
         // song-side gets the local target.
@@ -379,11 +325,19 @@ public class SubsonicController : ControllerBase
             externalAlbums = new List<Album>();
         }
 
+        List<Artist> externalArtists;
+        try { externalArtists = await artistTask; }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("external artist search failed for '{Q}': {M}", cleanQuery, ex.Message);
+            externalArtists = new List<Artist>();
+        }
+
         var externalResult = new SearchResult
         {
             Songs = externalSongs,
             Albums = externalAlbums,
-            Artists = new List<Artist>(),
+            Artists = externalArtists,
         };
 
         // Track this response as a "queue" so a later scrobble for any of its
@@ -448,7 +402,7 @@ public class SubsonicController : ControllerBase
     ///      single-word artist queries)
     /// We dedupe by artist+title to avoid the same track appearing twice.
     /// </summary>
-    private async Task<List<Song>> BuildExternalSearchResultsAsync(string query, int target)
+    private async Task<List<Song>> BuildExternalSearchResultsAsync(string query, int target, bool prewarm = true)
     {
         if (target <= 0 || _lastFmService is null || !_lastFmService.IsConfigured)
             return new List<Song>();
@@ -492,7 +446,10 @@ public class SubsonicController : ControllerBase
         // (ytsearch1: + -g, 6-16s combined). Arpeggi cancels at ~10s and falls
         // back to a local song; without this, external playback is unreachable
         // from that client. 12 ≈ what fits on the first page of search results.
-        _ = _metadataService.PrewarmYouTubeIdsAsync(songs, topN: 12);
+        if (prewarm)
+        {
+            _ = _metadataService.PrewarmYouTubeIdsAsync(songs, topN: 12);
+        }
 
         return songs;
     }
@@ -1003,10 +960,10 @@ public class SubsonicController : ControllerBase
                 if (playlist == null || string.IsNullOrEmpty(playlist.CoverUrl))
                     return ServePlaceholder();
 
-                using var http = new HttpClient();
-                var imageResponse = await http.GetAsync(playlist.CoverUrl);
+                var http = _httpClientFactory.CreateClient();
+                using var imageResponse = await http.GetAsync(playlist.CoverUrl, HttpContext.RequestAborted);
                 if (!imageResponse.IsSuccessStatusCode) return ServePlaceholder();
-                var imageBytes = await imageResponse.Content.ReadAsByteArrayAsync();
+                var imageBytes = await imageResponse.Content.ReadAsByteArrayAsync(HttpContext.RequestAborted);
                 var contentType = imageResponse.Content.Headers.ContentType?.ToString() ?? "image/jpeg";
                 return File(imageBytes, contentType);
             }
@@ -1067,13 +1024,25 @@ public class SubsonicController : ControllerBase
 
             if (coverUrl != null)
             {
-                using var httpClient = new HttpClient();
-                var response = await httpClient.GetAsync(coverUrl);
-                if (response.IsSuccessStatusCode)
+                // Guarded like the playlist-cover path above: this fetches from a
+                // third-party CDN, so a DNS/TLS/timeout failure (or the client
+                // hanging up) must degrade to the placeholder rather than bubbling
+                // out as a 500 — clients render a broken tile for an error status
+                // but show artwork fine for a placeholder.
+                try
                 {
-                    var imageBytes = await response.Content.ReadAsByteArrayAsync();
-                    var watermarked = _coverArtService?.AddOctoBadge(imageBytes) ?? imageBytes;
-                    return File(watermarked, "image/jpeg");
+                    var httpClient = _httpClientFactory.CreateClient();
+                    using var response = await httpClient.GetAsync(coverUrl, HttpContext.RequestAborted);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var imageBytes = await response.Content.ReadAsByteArrayAsync(HttpContext.RequestAborted);
+                        var watermarked = _coverArtService?.AddOctoBadge(imageBytes) ?? imageBytes;
+                        return File(watermarked, "image/jpeg");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Cover art fetch failed for {Id} from {Url}", id, coverUrl);
                 }
             }
             return ServePlaceholder();
@@ -1191,6 +1160,59 @@ public class SubsonicController : ControllerBase
     /// Stars (favorites) an item. For playlists and external songs, triggers download.
     /// </summary>
     [HttpGet, HttpPost]
+    [Route("rest/getTopSongs")]
+    [Route("rest/getTopSongs.view")]
+    public async Task<IActionResult> GetTopSongs()
+    {
+        var parameters = await ExtractAllParameters();
+        var format = parameters.GetValueOrDefault("f", "xml");
+        var artistName = parameters.GetValueOrDefault("artist", "");
+        var countStr = parameters.GetValueOrDefault("count", "5");
+        var count = int.TryParse(countStr, out var c) && c > 0 ? c : 5;
+
+        if (string.IsNullOrWhiteSpace(artistName))
+        {
+            return _responseBuilder.CreateError(format, 10, "Missing artist parameter");
+        }
+
+        // Standard Subsonic endpoint, previously unimplemented here -- artist pages
+        // had no reliable "popular songs" section. Deezer-only (no local-library
+        // merge): resolve the artist by name, pull their top tracks, and run each
+        // through the normal external song-search path so it comes back as a real
+        // playable/starrable Song, same as everything else external search returns.
+        var artistId = SoulseekMetadataService.ProviderName;
+        var artistHits = await _metadataService.SearchArtistsAsync(artistName, 1);
+        var songs = new List<Song>();
+        if (artistHits.Count > 0)
+        {
+            songs = await _metadataService.GetArtistTopSongsAsync(
+                artistHits[0].ExternalProvider ?? artistId, artistHits[0].ExternalId ?? "", count);
+        }
+
+        if (format == "json")
+        {
+            var jsonSongs = songs.Select(s => _responseBuilder.ConvertSongToJson(s)).ToList();
+            return _responseBuilder.CreateJsonResponse(new
+            {
+                status = "ok",
+                version = "1.16.1",
+                topSongs = new { song = jsonSongs },
+            });
+        }
+
+        var ns = System.Xml.Linq.XNamespace.Get("http://subsonic.org/restapi");
+        var doc = new System.Xml.Linq.XDocument(
+            new System.Xml.Linq.XElement(ns + "subsonic-response",
+                new System.Xml.Linq.XAttribute("status", "ok"),
+                new System.Xml.Linq.XAttribute("version", "1.16.1"),
+                new System.Xml.Linq.XElement(ns + "topSongs",
+                    songs.Select(s => _responseBuilder.ConvertSongToXml(s, ns))
+                )
+            )
+        );
+        return new ContentResult { Content = doc.ToString(), ContentType = "application/xml" };
+    }
+
     [Route("rest/star")]
     [Route("rest/star.view")]
     public async Task<IActionResult> Star()
@@ -1419,7 +1441,18 @@ public class SubsonicController : ControllerBase
         _logger.LogInformation("Getting similar songs for {Artist} - {Title} (lookup: {LookA} - {LookT})",
             artistName, trackTitle, lookupArtist, lookupTitle);
 
-        var similarTracks = await _lastFmService.GetSimilarTracksAsync(lookupArtist, lookupTitle, count);
+        // ListenBrainz's session-based collaborative filtering is generally
+        // stronger/less generic than Last.fm's tag-based similarity, and needs
+        // no account/token -- try it first, fall back to Last.fm on a miss
+        // (unknown recording, transient API issue, etc.) rather than failing
+        // the whole radio request.
+        var similarTracks = _listenBrainzService != null
+            ? await _listenBrainzService.GetSimilarTracksAsync(lookupArtist, lookupTitle, count)
+            : new List<LastFmService.SimilarTrack>();
+        if (similarTracks.Count == 0)
+        {
+            similarTracks = await _lastFmService.GetSimilarTracksAsync(lookupArtist, lookupTitle, count);
+        }
 
         if (similarTracks.Count == 0)
         {
@@ -1808,9 +1841,14 @@ public class SubsonicController : ControllerBase
         {
             var artist = await _metadataService.GetArtistAsync(provider!, externalId!);
             var url = artist?.ImageUrl ?? "";
+            var bio = "";
+            if (!string.IsNullOrEmpty(artist?.Name) && _lastFmService != null)
+            {
+                bio = await _lastFmService.GetArtistBioAsync(artist.Name);
+            }
             return _responseBuilder.CreateInfoResponse(format, "artistInfo2", new Dictionary<string, string>
             {
-                ["biography"] = "",
+                ["biography"] = bio,
                 ["smallImageUrl"] = url,
                 ["mediumImageUrl"] = url,
                 ["largeImageUrl"] = url,

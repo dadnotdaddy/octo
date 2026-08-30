@@ -23,11 +23,12 @@ public class SubsonicProxyService
     }
 
     /// <summary>
-    /// Relays a request to the Subsonic server and returns the response.
+    /// The configured upstream base URL, validated and with any trailing slash
+    /// removed. Every outgoing URL is built from this so a trailing slash in the
+    /// configured value can't produce "http://host//rest/..." on one code path
+    /// while working on another.
     /// </summary>
-    public async Task<(byte[] Body, string? ContentType)> RelayAsync(
-        string endpoint, 
-        Dictionary<string, string> parameters)
+    private string UpstreamBase()
     {
         if (string.IsNullOrWhiteSpace(_subsonicSettings.Url)
             || !Uri.TryCreate(_subsonicSettings.Url, UriKind.Absolute, out _))
@@ -38,16 +39,40 @@ public class SubsonicProxyService
                 "from the Octo container, not localhost.");
         }
 
-        var query = string.Join("&", parameters.Select(kv =>
-            $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
-        var url = $"{_subsonicSettings.Url.TrimEnd('/')}/{endpoint}?{query}";
+        return _subsonicSettings.Url.TrimEnd('/');
+    }
 
-        HttpResponseMessage response = await _httpClient.GetAsync(url);
+    /// <summary>
+    /// The token to actually use for an upstream call. Callers relaying on behalf of a
+    /// live request rarely thread one through explicitly, so when none is supplied we
+    /// fall back to the current request's abort token — that way a client hanging up
+    /// stops the upstream work instead of leaving it running to completion server-side.
+    /// Falls back to None outside a request (background/startup callers).
+    /// </summary>
+    private CancellationToken Effective(CancellationToken ct) =>
+        ct.CanBeCanceled ? ct : (_httpContextAccessor.HttpContext?.RequestAborted ?? CancellationToken.None);
+
+    private static string BuildQuery(Dictionary<string, string> parameters) =>
+        string.Join("&", parameters.Select(kv =>
+            $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+
+    /// <summary>
+    /// Relays a request to the Subsonic server and returns the response.
+    /// </summary>
+    public async Task<(byte[] Body, string? ContentType)> RelayAsync(
+        string endpoint,
+        Dictionary<string, string> parameters,
+        CancellationToken cancellationToken = default)
+    {
+        var url = $"{UpstreamBase()}/{endpoint}?{BuildQuery(parameters)}";
+        var ct = Effective(cancellationToken);
+
+        using var response = await _httpClient.GetAsync(url, ct);
         response.EnsureSuccessStatusCode();
-        
-        var body = await response.Content.ReadAsByteArrayAsync();
+
+        var body = await response.Content.ReadAsByteArrayAsync(ct);
         var contentType = response.Content.Headers.ContentType?.ToString();
-        
+
         return (body, contentType);
     }
 
@@ -74,20 +99,10 @@ public class SubsonicProxyService
 
     public async Task<RawRelayResult> RelayRawAsync(
         string endpoint,
-        Dictionary<string, string> parameters)
+        Dictionary<string, string> parameters,
+        CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(_subsonicSettings.Url)
-            || !Uri.TryCreate(_subsonicSettings.Url, UriKind.Absolute, out _))
-        {
-            throw new OctoNotConfiguredException(
-                "Octo has no valid Navidrome URL. Set SUBSONIC_URL (Subsonic__Url) to your " +
-                "Navidrome server, e.g. http://192.168.1.10:4533 — an absolute URL reachable " +
-                "from the Octo container, not localhost.");
-        }
-
-        var query = string.Join("&", parameters.Select(kv =>
-            $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
-        var url = $"{_subsonicSettings.Url.TrimEnd('/')}/{endpoint}?{query}";
+        var url = $"{UpstreamBase()}/{endpoint}?{BuildQuery(parameters)}";
 
         var ctx = _httpContextAccessor.HttpContext;
         var incoming = ctx?.Request;
@@ -112,8 +127,9 @@ public class SubsonicProxyService
                     req.Headers.TryAddWithoutValidation(h, vals.ToArray());
         }
 
-        using var response = await _httpClient.SendAsync(req);
-        var body = await response.Content.ReadAsByteArrayAsync();
+        var ct = Effective(cancellationToken);
+        using var response = await _httpClient.SendAsync(req, ct);
+        var body = await response.Content.ReadAsByteArrayAsync(ct);
 
         var respHeaders = new List<KeyValuePair<string, string>>();
         foreach (var h in ForwardResponseHeaders)
@@ -131,12 +147,13 @@ public class SubsonicProxyService
     /// Safely relays a request to the Subsonic server, returning null on failure.
     /// </summary>
     public async Task<(byte[]? Body, string? ContentType, bool Success)> RelaySafeAsync(
-        string endpoint, 
-        Dictionary<string, string> parameters)
+        string endpoint,
+        Dictionary<string, string> parameters,
+        CancellationToken cancellationToken = default)
     {
         try
         {
-            var result = await RelayAsync(endpoint, parameters);
+            var result = await RelayAsync(endpoint, parameters, cancellationToken);
             return (result.Body, result.ContentType, true);
         }
         catch
@@ -176,9 +193,7 @@ public class SubsonicProxyService
             var incomingRequest = httpContext.Request;
             var outgoingResponse = httpContext.Response;
 
-            var query = string.Join("&", parameters.Select(kv => 
-                $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
-            var url = $"{_subsonicSettings.Url}/rest/stream?{query}";
+            var url = $"{UpstreamBase()}/rest/stream?{BuildQuery(parameters)}";
             
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
 
@@ -223,6 +238,19 @@ public class SubsonicProxyService
             {
                 EnableRangeProcessing = true
             };
+        }
+        catch (OctoNotConfiguredException)
+        {
+            // Let the global handler surface the actionable "set SUBSONIC_URL"
+            // message instead of burying it in a generic 500, same as the other
+            // relay methods do.
+            throw;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Client hung up mid-stream (seek, skip, app backgrounded). Normal for
+            // audio streaming — not a server error worth a 500 and a log line.
+            return new StatusCodeResult(499);
         }
         catch (Exception ex)
         {

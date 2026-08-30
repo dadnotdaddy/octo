@@ -38,6 +38,8 @@ from requests.adapters import HTTPAdapter
 from flask import Flask, Response, abort, jsonify, request, stream_with_context
 
 YTDLP = os.environ.get("YTDLP_PATH", "/usr/local/bin/yt-dlp")
+COOKIES_PATH = os.environ.get("YTDLP_COOKIES_PATH", "/app/cookies.txt")
+POT_BASE_URL = os.environ.get("BGUTIL_POT_BASE_URL", "http://bgutil-pot:4416")
 PORT = int(os.environ.get("PORT", "8080"))
 
 # Root the /download endpoint is allowed to write under (the shared music mount).
@@ -150,7 +152,13 @@ def _run(args: list[str], timeout: int = 20, label: str = "ytdlp") -> Optional[s
         # player base.js + solved nsig signatures; disabling it forced a
         # re-download and re-solve on every fork. A persistent cache volume is
         # mounted in compose.
-        full = [YTDLP, "--no-warnings", "--no-playlist", *args]
+        cookie_args = ["--cookies", COOKIES_PATH] if os.path.exists(COOKIES_PATH) else []
+        # Tell the bgutil-ytdlp-pot-provider plugin where its sidecar HTTP
+        # server lives, so it can fetch a PO token for the actual googlevideo
+        # stream request. Without this, YouTube 403s that request even when
+        # search/resolve succeeded (they use a different, token-exempt path).
+        pot_args = ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_BASE_URL}"]
+        full = [YTDLP, "--no-warnings", "--no-playlist", *cookie_args, *pot_args, *args]
         t_run = time.monotonic()
         try:
             cp = subprocess.run(
@@ -237,7 +245,14 @@ def _search_single(q: str) -> Optional[dict]:
         return None
     payload = _payload_from(data)
     stream_url = lines[1] if len(lines) > 1 else None
-    if payload.get("video_id") and stream_url:
+    # yt-dlp's template printer emits the literal string "NA" for a field
+    # that's missing/None -- happens whenever the selected format has no
+    # single direct-download url (common for DASH/adaptive audio formats).
+    # Caching that string as a real URL poisons every subsequent /stream for
+    # this video with an unrecoverable "Invalid URL "NA"" failure. Skip the
+    # cache warm in that case and let /stream fall through to _resolve_url's
+    # `yt-dlp -g`, which resolves the same format correctly.
+    if payload.get("video_id") and stream_url and stream_url != "NA":
         # Warm the URL cache from the SAME extraction. This used to be a second
         # `yt-dlp -g` on a detached daemon thread; folding it in removes an
         # entire yt-dlp invocation per track and makes the warm /stream path a

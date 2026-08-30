@@ -43,7 +43,12 @@ public abstract class BaseDownloadService : IDownloadService
     // guarded and the only unguarded reader was dead code; enabling album downloads makes
     // that pattern live, and concurrent read+write on Dictionary is undefined.
     protected readonly ConcurrentDictionary<string, DownloadInfo> ActiveDownloads = new();
-    protected readonly SemaphoreSlim DownloadLock = new(1, 1);
+    // Was new(1, 1) -- one download at a time system-wide regardless of available
+    // bandwidth. Raised to allow several tracks (even across different albums) to
+    // transfer concurrently; still bounded so a handful of slow/stalled peers can't
+    // starve every other queued track.
+    private const int MaxConcurrentDownloads = 6;
+    protected readonly SemaphoreSlim DownloadLock = new(MaxConcurrentDownloads, MaxConcurrentDownloads);
     
     /// <summary>
     /// Lazy-loaded PlaylistSyncService to avoid circular dependency
@@ -279,7 +284,20 @@ public abstract class BaseDownloadService : IDownloadService
         
         // Acquire lock BEFORE checking existence to prevent race conditions with concurrent requests
         await DownloadLock.WaitAsync(cancellationToken);
-        
+        // Tracks whether we still owe a Release. The wait-for-in-progress branch below
+        // hands the permit back early so it doesn't hold a download slot while idling,
+        // and without this flag the finally would release a SECOND time — inflating the
+        // semaphore past MaxConcurrentDownloads (or throwing SemaphoreFullException when
+        // the pool is idle). Every exit path goes through the finally, including the
+        // early return and throw inside that branch.
+        var holdsDownloadLock = true;
+        // Whether THIS call created the ActiveDownloads entry for songId. A call that
+        // only waited on someone else's in-progress download must not report failure
+        // on their behalf: doing so flips a healthy, still-running download to Failed,
+        // which then makes every other waiter bail out too while the real download
+        // goes on to succeed.
+        var ownsDownloadInfo = false;
+
         try
         {
             // Check if already downloaded (skip for cache mode as we want to check cache folder)
@@ -309,19 +327,36 @@ public abstract class BaseDownloadService : IDownloadService
             if (ActiveDownloads.TryGetValue(songId, out var activeDownload) && activeDownload.Status == DownloadStatus.InProgress)
             {
                 Logger.LogInformation("Download already in progress for {SongId}, waiting...", songId);
-                // Release lock while waiting
+                // Release lock while waiting — don't occupy a download slot just to poll.
+                // Clear the flag FIRST: if Release() itself throws, the finally must not
+                // try to release a second time and compound the problem.
+                holdsDownloadLock = false;
                 DownloadLock.Release();
-                
-                while (ActiveDownloads.TryGetValue(songId, out activeDownload) && activeDownload.Status == DownloadStatus.InProgress)
+
+                // Bounded wait. A peer that accepts the transfer and then stalls leaves
+                // the owning download InProgress indefinitely; without a cap every
+                // duplicate request for that track would poll forever, and callers
+                // (a client waiting on /rest/stream) would hang with it.
+                var waitedMs = 0;
+                const int pollIntervalMs = 500;
+                const int maxWaitMs = 10 * 60 * 1000;
+                while (ActiveDownloads.TryGetValue(songId, out activeDownload)
+                       && activeDownload.Status == DownloadStatus.InProgress)
                 {
-                    await Task.Delay(500, cancellationToken);
+                    if (waitedMs >= maxWaitMs)
+                    {
+                        throw new TimeoutException(
+                            $"Timed out after {maxWaitMs / 1000}s waiting on an in-progress download of {songId}");
+                    }
+                    await Task.Delay(pollIntervalMs, cancellationToken);
+                    waitedMs += pollIntervalMs;
                 }
-                
+
                 if (activeDownload?.Status == DownloadStatus.Completed && activeDownload.LocalPath != null)
                 {
                     return activeDownload.LocalPath;
                 }
-                
+
                 throw new Exception(activeDownload?.ErrorMessage ?? "Download failed");
             }
 
@@ -369,6 +404,10 @@ public abstract class BaseDownloadService : IDownloadService
                 StartedAt = DateTime.UtcNow
             };
             ActiveDownloads[songId] = downloadInfo;
+            // From here on this call OWNS the ActiveDownloads entry for songId, and is
+            // the only one allowed to mark it Failed. A concurrent caller that merely
+            // waited on this download must never write to it — see the catch below.
+            ownsDownloadInfo = true;
 
             var localPath = await DownloadTrackAsync(externalId, song, cancellationToken);
             
@@ -442,7 +481,11 @@ public abstract class BaseDownloadService : IDownloadService
         }
         catch (Exception ex)
         {
-            if (ActiveDownloads.TryGetValue(songId, out var downloadInfo))
+            // Only the owner reports failure. Without this guard a waiter that gave up
+            // (timeout, or the owner already failed) would stamp Failed onto a record
+            // it doesn't own — cascading a single slow download into failures for
+            // every concurrent request for the same track.
+            if (ownsDownloadInfo && ActiveDownloads.TryGetValue(songId, out var downloadInfo))
             {
                 downloadInfo.Status = DownloadStatus.Failed;
                 downloadInfo.ErrorMessage = ex.Message;
@@ -452,7 +495,7 @@ public abstract class BaseDownloadService : IDownloadService
         }
         finally
         {
-            DownloadLock.Release();
+            if (holdsDownloadLock) DownloadLock.Release();
         }
     }
     
@@ -520,9 +563,142 @@ public abstract class BaseDownloadService : IDownloadService
             }
         }
 
+        // Final consistency pass: strip every file in the album's folder and rewrite
+        // Album/AlbumArtist/Year/Genre/cover art from ONE canonical Deezer album lookup
+        // instead of relying on each track's own (frequently disagreeing) per-track
+        // lookup. This is what actually guarantees every track groups as a single album
+        // in Navidrome — two earlier attempts at per-track agreement (clearing leftover
+        // MusicBrainz/sort tags, then a shared in-memory Year cache) both still let
+        // individual tracks diverge on Year because each one's own Deezer match could
+        // differ. Runs on the whole folder, not just this batch, so it also normalizes
+        // the one track that triggered the album download in the first place.
+        try
+        {
+            var albumArtist = !string.IsNullOrEmpty(album.Artist)
+                ? album.Artist
+                : tracksToDownload.FirstOrDefault()?.AlbumArtist ?? tracksToDownload.FirstOrDefault()?.Artist ?? "";
+            var albumFolder = Path.Combine(
+                DownloadPath,
+                PathHelper.SanitizeFolderName(albumArtist),
+                PathHelper.SanitizeFolderName(album.Title));
+            await NormalizeAlbumMetadataAsync(albumFolder, albumArtist, album.Title, CancellationToken.None);
+            await LocalLibraryService.TriggerLibraryScanAsync(force: true);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Album metadata normalization failed for '{AlbumTitle}'", album.Title);
+        }
+
         Logger.LogInformation("Completed background download for album '{AlbumTitle}'", album.Title);
     }
-    
+
+    /// <summary>
+    /// One-time final pass over a completed album folder: resolves Album/AlbumArtist/
+    /// Year/Genre/cover art ONCE from a single Deezer album lookup (not per track),
+    /// strips every existing tag from every file in the folder, then rewrites those
+    /// shared album-level fields identically everywhere, preserving only each file's
+    /// own per-track fields (title, artist, track/disc number, composer, ISRC comment).
+    /// Best-effort throughout: a missed Deezer match or a single file's write failure
+    /// just leaves that file with whatever tags its own download already gave it.
+    /// </summary>
+    protected async Task NormalizeAlbumMetadataAsync(string albumFolder, string fallbackArtist, string fallbackAlbum, CancellationToken cancellationToken)
+    {
+        if (!Directory.Exists(albumFolder))
+        {
+            Logger.LogWarning("Album normalize: folder not found, skipping: {Folder}", albumFolder);
+            return;
+        }
+
+        var files = Directory.EnumerateFiles(albumFolder)
+            .Where(f => f.EndsWith(".flac", StringComparison.OrdinalIgnoreCase)
+                     || f.EndsWith(".mp3", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (files.Count == 0)
+        {
+            Logger.LogWarning("Album normalize: no audio files found in {Folder}", albumFolder);
+            return;
+        }
+
+        var deezer = _serviceProvider.GetService<Octo.Services.Metadata.DeezerMetadataService>();
+        if (deezer == null) return;
+
+        var albumId = await deezer.FindAlbumIdAsync(fallbackArtist, fallbackAlbum, cancellationToken);
+        if (string.IsNullOrEmpty(albumId))
+        {
+            Logger.LogWarning(
+                "Album normalize: no Deezer match for '{Artist} - {Album}', leaving per-track tags as-is",
+                fallbackArtist, fallbackAlbum);
+            return;
+        }
+
+        var detail = await deezer.GetAlbumDetailAsync(albumId, cancellationToken);
+        if (detail == null) return;
+
+        byte[]? coverData = !string.IsNullOrEmpty(detail.CoverUrl)
+            ? await DownloadCoverArtAsync(detail.CoverUrl, cancellationToken)
+            : null;
+
+        Logger.LogInformation(
+            "Album normalize: '{Album}' by {Artist} -> Year={Year} Genre={Genre}, applying to {Count} files",
+            detail.Title, detail.Artist, detail.Year, detail.Genre, files.Count);
+
+        foreach (var file in files)
+        {
+            try
+            {
+                using var tagFile = TagLib.File.Create(file);
+
+                // Preserve per-track identity before wiping everything else.
+                var title = tagFile.Tag.Title;
+                var performers = tagFile.Tag.Performers;
+                var track = tagFile.Tag.Track;
+                var trackCount = tagFile.Tag.TrackCount;
+                var disc = tagFile.Tag.Disc;
+                var composers = tagFile.Tag.Composers;
+                var comment = tagFile.Tag.Comment;
+
+                tagFile.Tag.Clear();
+
+                if (!string.IsNullOrEmpty(title)) tagFile.Tag.Title = title;
+                if (performers is { Length: > 0 }) tagFile.Tag.Performers = performers;
+                if (track > 0) tagFile.Tag.Track = track;
+                if (trackCount > 0) tagFile.Tag.TrackCount = trackCount;
+                if (disc > 0) tagFile.Tag.Disc = disc;
+                if (composers is { Length: > 0 }) tagFile.Tag.Composers = composers;
+                if (!string.IsNullOrEmpty(comment)) tagFile.Tag.Comment = comment;
+
+                // Shared album-level fields: identical on every file, from one lookup.
+                tagFile.Tag.Album = detail.Title;
+                tagFile.Tag.AlbumArtists = new[] { detail.Artist };
+                tagFile.Tag.Year = detail.Year.HasValue ? (uint)detail.Year.Value : 0;
+                if (!string.IsNullOrEmpty(detail.Genre)) tagFile.Tag.Genres = new[] { detail.Genre };
+
+                if (coverData is { Length: > 0 })
+                {
+                    tagFile.Tag.Pictures = new TagLib.IPicture[]
+                    {
+                        new TagLib.Picture
+                        {
+                            Type = TagLib.PictureType.FrontCover,
+                            MimeType = "image/jpeg",
+                            Description = "Cover",
+                            Data = new TagLib.ByteVector(coverData)
+                        }
+                    };
+                }
+
+                tagFile.Save();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Album normalize: failed to rewrite tags for {File}", file);
+            }
+        }
+
+        Logger.LogInformation("Album normalize: completed consistency pass for '{Album}'", detail.Title);
+    }
+
     #endregion
     
     #region Common Metadata Writing
@@ -612,12 +788,39 @@ public abstract class BaseDownloadService : IDownloadService
             // FLAC keeps its own album if Deezer had no match.
             if (!string.IsNullOrEmpty(song.Title)) tagFile.Tag.Title = song.Title;
             if (!string.IsNullOrEmpty(song.Artist)) tagFile.Tag.Performers = new[] { song.Artist };
-            if (!string.IsNullOrEmpty(song.Album)) tagFile.Tag.Album = song.Album;
+            if (!string.IsNullOrEmpty(song.Album))
+            {
+                tagFile.Tag.Album = song.Album;
+                // Soulseek uploaders often mix tracks pulled from different releases
+                // (standard vs. deluxe editions, or untagged rips) into one shared
+                // folder. Each file can carry its own embedded MusicBrainz release
+                // id from wherever it originally came from, and Navidrome groups
+                // albums by that id when present — so a single album we organized
+                // into one folder can still fragment into two or three "albums" in
+                // the client. Since we're the ones assigning the canonical Album
+                // name here, clear the leftover per-file release ids too so every
+                // track in the album groups the same way (by name + album artist).
+                // Empty string, not null: TagLib.Ogg.XiphComment's MusicBrainz setters
+                // throw a NullReferenceException on a literal null (confirmed against
+                // a real FLAC — it crashed every metadata write silently, caught by
+                // the catch below, so tags never got touched at all). Empty string is
+                // the correct "clear this field" value for Xiph comments.
+                tagFile.Tag.MusicBrainzReleaseId = "";
+                tagFile.Tag.MusicBrainzReleaseGroupId = "";
+                tagFile.Tag.MusicBrainzReleaseArtistId = "";
+                // Same story for *SORT fields: Navidrome's album identity also factors
+                // in the album-artist sort name, and a Soulseek upload mixing releases
+                // means some files carry ARTISTSORT/ALBUMARTISTSORT and others don't —
+                // that mismatch alone is enough to split one album into two. Clear the
+                // leftover sort tags so every track in the album agrees (has none).
+                tagFile.Tag.PerformersSort = Array.Empty<string>();
+                tagFile.Tag.AlbumArtistsSort = Array.Empty<string>();
+            }
             if (!string.IsNullOrEmpty(song.AlbumArtist))
                 tagFile.Tag.AlbumArtists = new[] { song.AlbumArtist };
             else if (!string.IsNullOrEmpty(song.Artist))
                 tagFile.Tag.AlbumArtists = new[] { song.Artist };
-            
+
             // Only write the track number when we actually have one, and only pair
             // the total with it — avoids a bogus "0/11" when Deezer's search result
             // carried the album total but not this track's position.
@@ -627,13 +830,24 @@ public abstract class BaseDownloadService : IDownloadService
                 if (song.TotalTracks.HasValue)
                     tagFile.Tag.TrackCount = (uint)song.TotalTracks.Value;
             }
-            
+
             if (song.DiscNumber.HasValue)
                 tagFile.Tag.Disc = (uint)song.DiscNumber.Value;
-            
-            if (song.Year.HasValue)
+
+            // Year, both cases in one place so there's only ever one line to change.
+            // Within an album we normalize to "the value we resolved, or none at all"
+            // (0 clears the tag) so tracks in a folder can't disagree — presence vs.
+            // absence alone is enough to split an album in Navidrome. This is only a
+            // best-effort first pass, though: NormalizeAlbumMetadataAsync re-stamps
+            // Year identically across the finished album from ONE canonical lookup,
+            // which is what actually guarantees agreement. For a standalone single
+            // there's no sibling track to agree with, so we only write a year we
+            // actually have and otherwise leave the peer's own tag untouched.
+            if (!string.IsNullOrEmpty(song.Album))
+                tagFile.Tag.Year = song.Year.HasValue ? (uint)song.Year.Value : 0;
+            else if (song.Year.HasValue)
                 tagFile.Tag.Year = (uint)song.Year.Value;
-            
+
             if (!string.IsNullOrEmpty(song.Genre))
                 tagFile.Tag.Genres = new[] { song.Genre };
             
@@ -696,8 +910,11 @@ public abstract class BaseDownloadService : IDownloadService
     {
         try
         {
-            using var httpClient = new HttpClient();
-            var response = await httpClient.GetAsync(url, cancellationToken);
+            // Factory-created, not `new HttpClient()`: this runs once per downloaded
+            // track (and again per album normalize pass), so a fresh handler each
+            // time would pile up sockets in TIME_WAIT across a large album batch.
+            var httpClient = _serviceProvider.GetRequiredService<IHttpClientFactory>().CreateClient();
+            using var response = await httpClient.GetAsync(url, cancellationToken);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsByteArrayAsync(cancellationToken);
         }

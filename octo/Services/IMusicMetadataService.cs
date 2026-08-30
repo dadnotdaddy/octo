@@ -102,6 +102,13 @@ public interface IMusicMetadataService
     Task<List<Album>> GetArtistAlbumsAsync(string externalProvider, string externalId);
     
     /// <summary>
+    /// An artist's most popular songs (e.g. top 5), for a rich artist profile page.
+    /// Default no-op preserves compatibility for any provider that doesn't support it.
+    /// </summary>
+    Task<List<Song>> GetArtistTopSongsAsync(string externalProvider, string externalId, int limit = 5)
+        => Task.FromResult(new List<Song>());
+    
+    /// <summary>
     /// Searches for playlists on external providers
     /// </summary>
     /// <param name="query">Search term</param>

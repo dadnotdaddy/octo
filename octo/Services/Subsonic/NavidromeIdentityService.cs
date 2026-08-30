@@ -63,16 +63,33 @@ public class NavidromeIdentityService
     }
 
     /// <summary>Subsonic auth triplet (u/t/s) for authenticated Subsonic calls such
-    /// as startScan, or null if no admin identity has been captured/configured yet.</summary>
-    public (string user, string token, string salt)? GetScanAuth()
+    /// as startScan, or null if no admin identity has been captured/configured yet.
+    /// A captured identity (from client traffic) is only good until Octo restarts —
+    /// it lives in memory only. When nothing is cached, fall back to a fresh login
+    /// with configured admin creds (same path DetectMusicFolderAsync uses) so scans
+    /// keep working unattended across restarts instead of needing someone to sign
+    /// back into a client before the next download can trigger a rescan.</summary>
+    public async Task<(string user, string token, string salt)?> GetScanAuthAsync(CancellationToken ct = default)
     {
-        lock (_lock)
+        (string, string, string)? cached()
         {
-            if (!string.IsNullOrEmpty(_username) && !string.IsNullOrEmpty(_subsonicToken)
-                && !string.IsNullOrEmpty(_subsonicSalt))
-                return (_username!, _subsonicToken!, _subsonicSalt!);
-            return null;
+            lock (_lock)
+            {
+                if (!string.IsNullOrEmpty(_username) && !string.IsNullOrEmpty(_subsonicToken)
+                    && !string.IsNullOrEmpty(_subsonicSalt))
+                    return (_username!, _subsonicToken!, _subsonicSalt!);
+                return null;
+            }
         }
+
+        var hit = cached();
+        if (hit is { } h) return h;
+
+        // Nothing cached — try a fresh admin login (no-op if AdminUsername/Password
+        // aren't configured; EnsureJwtAsync's CaptureLogin call populates the same
+        // fields cached() reads, so a second check picks up the fresh identity).
+        await EnsureJwtAsync(ct);
+        return cached();
     }
 
     /// <summary>

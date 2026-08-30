@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Octo.Models.Settings;
@@ -6,20 +7,23 @@ namespace Octo.Services.LastFm;
 
 public class LastFmService
 {
-    private readonly HttpClient _httpClient;
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly LastFmSettings _settings;
     private readonly ILogger<LastFmService> _logger;
     private const string BaseUrl = "https://ws.audioscrobbler.com/2.0/";
     
-    // Simple in-memory cache
-    private readonly Dictionary<string, (DateTime Expiry, List<SimilarTrack> Tracks)> _cache = new();
+    // Simple in-memory cache. Concurrent because this service is a singleton and
+    // GetSimilarTracksAsync is called from concurrent request threads — a plain
+    // Dictionary read during another thread's write is undefined behavior (torn
+    // reads, or an InvalidOperationException out of TryGetValue).
+    private readonly ConcurrentDictionary<string, (DateTime Expiry, List<SimilarTrack> Tracks)> _cache = new();
 
     public LastFmService(
-        HttpClient httpClient,
+        IHttpClientFactory httpClientFactory,
         IOptions<LastFmSettings> settings,
         ILogger<LastFmService> logger)
     {
-        _httpClient = httpClient;
+        _httpClientFactory = httpClientFactory;
         _settings = settings.Value;
         _logger = logger;
     }
@@ -44,7 +48,7 @@ public class LastFmService
             
             _logger.LogInformation("Fetching similar tracks from Last.fm for {Artist} - {Title}", artist, title);
             
-            var response = await _httpClient.GetAsync(url);
+            var response = await _httpClientFactory.CreateClient().GetAsync(url);
             response.EnsureSuccessStatusCode();
             
             var json = await response.Content.ReadAsStringAsync();
@@ -131,7 +135,7 @@ public class LastFmService
             // Get similar artists
             var artistUrl = $"{BaseUrl}?method=artist.getsimilar&artist={Uri.EscapeDataString(artist)}&api_key={_settings.ApiKey}&format=json&limit=10";
             
-            var artistResponse = await _httpClient.GetAsync(artistUrl);
+            var artistResponse = await _httpClientFactory.CreateClient().GetAsync(artistUrl);
             artistResponse.EnsureSuccessStatusCode();
             
             var artistJson = await artistResponse.Content.ReadAsStringAsync();
@@ -161,7 +165,7 @@ public class LastFmService
             {
                 var topTracksUrl = $"{BaseUrl}?method=artist.gettoptracks&artist={Uri.EscapeDataString(similarArtist)}&api_key={_settings.ApiKey}&format=json&limit=10";
                 
-                var topResponse = await _httpClient.GetAsync(topTracksUrl);
+                var topResponse = await _httpClientFactory.CreateClient().GetAsync(topTracksUrl);
                 if (!topResponse.IsSuccessStatusCode) continue;
                 
                 var topJson = await topResponse.Content.ReadAsStringAsync();
@@ -193,6 +197,40 @@ public class LastFmService
         }
     }
 
+    /// <summary>
+    /// Plain-text artist bio via artist.getinfo, for the external-artist profile
+    /// view (getArtistInfo2) -- previously always blank since nothing populated it.
+    /// Last.fm's bio comes as HTML-ish text with a trailing "Read more on Last.fm"
+    /// link; strip that link line since it points to a page playback can't use.
+    /// </summary>
+    public async Task<string> GetArtistBioAsync(string artist)
+    {
+        if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrEmpty(_settings.ApiKey)) return "";
+        try
+        {
+            var url = $"{BaseUrl}?method=artist.getinfo&artist={Uri.EscapeDataString(artist)}&api_key={_settings.ApiKey}&format=json";
+            var response = await _httpClientFactory.CreateClient().GetAsync(url);
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+
+            if (doc.RootElement.TryGetProperty("artist", out var artistEl) &&
+                artistEl.TryGetProperty("bio", out var bioEl) &&
+                bioEl.TryGetProperty("summary", out var summaryEl))
+            {
+                var summary = summaryEl.GetString() ?? "";
+                var cutIdx = summary.IndexOf("<a href", StringComparison.OrdinalIgnoreCase);
+                if (cutIdx >= 0) summary = summary[..cutIdx].TrimEnd();
+                return summary;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Last.fm artist.getinfo bio fetch failed for '{Artist}'", artist);
+        }
+        return "";
+    }
+
     public bool IsConfigured => !string.IsNullOrEmpty(_settings.ApiKey) && _settings.EnableRadio;
 
     /// <summary>
@@ -207,7 +245,7 @@ public class LastFmService
         try
         {
             var url = $"{BaseUrl}?method=track.search&track={Uri.EscapeDataString(query)}&api_key={_settings.ApiKey}&format=json&limit={limit}";
-            var response = await _httpClient.GetAsync(url);
+            var response = await _httpClientFactory.CreateClient().GetAsync(url);
             response.EnsureSuccessStatusCode();
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
@@ -247,7 +285,7 @@ public class LastFmService
         try
         {
             var url = $"{BaseUrl}?method=artist.gettoptracks&artist={Uri.EscapeDataString(artist)}&api_key={_settings.ApiKey}&format=json&limit={limit}";
-            var response = await _httpClient.GetAsync(url);
+            var response = await _httpClientFactory.CreateClient().GetAsync(url);
             response.EnsureSuccessStatusCode();
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);

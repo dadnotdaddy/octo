@@ -8,15 +8,19 @@ namespace Octo.Services.Metadata;
 /// from Deezer's public API. Keyless and no ARL — the ARL that expires on the
 /// music bot is only for Deezer AUDIO; metadata endpoints are open.
 ///
-/// Everything here is best-effort and cached: a Deezer outage, throttle, or miss
-/// returns null, and callers fall back to a synthetic entity. Nothing on this
-/// path ever blocks or fails playback.
+/// Everything here is best-effort and uncached: every call hits Deezer fresh so a
+/// transient miss (throttle, outage) never sticks around as a false negative --
+/// a Deezer outage or miss returns null and callers fall back to a synthetic
+/// entity. Nothing on this path ever blocks or fails playback.
 /// </summary>
 public class DeezerMetadataService
 {
     public record TrackMeta(string? AlbumTitle, string? AlbumCoverUrl, int? Year, int? Duration,
         string? ArtistName, string? ArtistImageUrl);
     public record ArtistMeta(string? Name, string? ImageUrl);
+    /// <summary>One artist from a catalog search, for populating search3's
+    /// artist results (previously always empty).</summary>
+    public record ArtistHit(string DeezerId, string Name, string? ImageUrl, int? AlbumCount);
 
     /// <summary>Everything Deezer knows about a track, for writing rich file tags.</summary>
     public record FullTrackMeta(
@@ -38,19 +42,13 @@ public class DeezerMetadataService
         string? CoverUrl, int? Year, string? Genre, string? Label, List<AlbumTrack> Tracks);
 
     private const string Base = "https://api.deezer.com";
-    private const int MaxCache = 4096;
 
     private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<DeezerMetadataService> _logger;
-    private readonly ConcurrentDictionary<string, TrackMeta?> _trackCache = new();
-    private readonly ConcurrentDictionary<string, FullTrackMeta?> _fullCache = new();
-    private readonly ConcurrentDictionary<string, ArtistMeta?> _artistCache = new();
-    private readonly ConcurrentDictionary<long, int?> _albumYearCache = new();
-    private readonly ConcurrentDictionary<string, List<AlbumHit>> _albumSearchCache = new();
-    private readonly ConcurrentDictionary<string, string?> _albumIdCache = new();
-    private readonly ConcurrentDictionary<string, AlbumDetail?> _albumDetailCache = new();
     // Single-flight the album-year fetch: many tracks in one search share an album
     // (a whole album's tracks), so concurrent lookups collapse onto one HTTP call.
+    // Not a result cache -- each entry is removed the moment its fetch completes,
+    // so a later search still hits Deezer fresh.
     private readonly ConcurrentDictionary<long, Lazy<Task<int?>>> _albumYearTasks = new();
 
     public DeezerMetadataService(IHttpClientFactory httpFactory, ILogger<DeezerMetadataService> logger)
@@ -72,9 +70,6 @@ public class DeezerMetadataService
     public async Task<TrackMeta?> EnrichTrackAsync(string? artist, string? title, bool includeYear = true, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title)) return null;
-        var key = $"{artist}|{title}".ToLowerInvariant();
-        if (_trackCache.TryGetValue(key, out var cached)) return cached;
-
         TrackMeta? meta = null;
         try
         {
@@ -107,7 +102,6 @@ public class DeezerMetadataService
             _logger.LogDebug("deezer enrich track '{A} - {T}' failed: {M}", artist, title, ex.Message);
         }
 
-        Cache(_trackCache, key, meta);
         return meta;
     }
 
@@ -119,9 +113,6 @@ public class DeezerMetadataService
     public async Task<FullTrackMeta?> EnrichTrackFullAsync(string? artist, string? title, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title)) return null;
-        var key = $"full|{artist}|{title}".ToLowerInvariant();
-        if (_fullCache.TryGetValue(key, out var cached)) return cached;
-
         FullTrackMeta? meta = null;
         try
         {
@@ -169,7 +160,6 @@ public class DeezerMetadataService
             _logger.LogDebug("deezer full enrich '{A} - {T}' failed: {M}", artist, title, ex.Message);
         }
 
-        Cache(_fullCache, key, meta);
         return meta;
     }
 
@@ -177,9 +167,6 @@ public class DeezerMetadataService
     public async Task<ArtistMeta?> EnrichArtistAsync(string? artist, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(artist)) return null;
-        var key = artist.ToLowerInvariant();
-        if (_artistCache.TryGetValue(key, out var cached)) return cached;
-
         ArtistMeta? meta = null;
         try
         {
@@ -193,8 +180,117 @@ public class DeezerMetadataService
             _logger.LogDebug("deezer enrich artist '{A}' failed: {M}", artist, ex.Message);
         }
 
-        Cache(_artistCache, key, meta);
         return meta;
+    }
+
+    /// <summary>Search the artist catalog directly (multiple results), for search3's
+    /// artist tab. Distinct from <see cref="EnrichArtistAsync"/>, which takes a single
+    /// known-good name and returns at most one match for tagging/enrichment.</summary>
+    public async Task<List<ArtistHit>> SearchArtistsAsync(string query, int limit, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(query) || limit <= 0) return new List<ArtistHit>();
+        var hits = new List<ArtistHit>();
+        try
+        {
+            var q = Uri.EscapeDataString(query);
+            using var doc = await GetJsonAsync($"{Base}/search/artist?q={q}&limit={limit}", ct);
+            if (doc is not null
+                && doc.RootElement.TryGetProperty("data", out var data)
+                && data.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var a in data.EnumerateArray())
+                {
+                    var id = a.TryGetProperty("id", out var aid) && aid.ValueKind == JsonValueKind.Number
+                        ? aid.GetInt64().ToString() : null;
+                    var name = Str(a, "name");
+                    if (id is null || string.IsNullOrWhiteSpace(name)) continue;
+
+                    hits.Add(new ArtistHit(id, name, Str(a, "picture_xl") ?? Str(a, "picture_medium"), Int(a, "nb_album")));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("deezer artist search '{Q}' failed: {M}", query, ex.Message);
+        }
+
+        return hits;
+    }
+
+    /// <summary>Every album from a Deezer artist id, used to populate an external
+    /// artist's discography. Singles are filtered out the same way SearchAlbumsAsync
+    /// does. This endpoint doesn't return a track count, so TrackCount is left 0 --
+    /// GetAlbumDetailAsync fills the real number when the album is opened.</summary>
+    public async Task<List<AlbumHit>> GetArtistAlbumsAsync(string deezerArtistId, int limit = 50, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(deezerArtistId) || limit <= 0) return new List<AlbumHit>();
+        var hits = new List<AlbumHit>();
+        try
+        {
+            using var doc = await GetJsonAsync($"{Base}/artist/{deezerArtistId}/albums?limit={limit}", ct);
+            if (doc is not null
+                && doc.RootElement.TryGetProperty("data", out var data)
+                && data.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var a in data.EnumerateArray())
+                {
+                    var id = a.TryGetProperty("id", out var aid) && aid.ValueKind == JsonValueKind.Number
+                        ? aid.GetInt64().ToString() : null;
+                    var title = Str(a, "title");
+                    if (id is null || string.IsNullOrWhiteSpace(title)) continue;
+
+                    var recordType = Str(a, "record_type");
+                    if (string.Equals(recordType, "single", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    int? year = null;
+                    var rd = Str(a, "release_date");
+                    if (!string.IsNullOrEmpty(rd) && rd.Length >= 4 && int.TryParse(rd[..4], out var yr))
+                        year = yr;
+
+                    hits.Add(new AlbumHit(
+                        id, title, "", // artist filled in by the caller, which already knows it
+                        Str(a, "cover_xl") ?? Str(a, "cover_medium"),
+                        year, 0, recordType));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("deezer artist albums '{Id}' failed: {M}", deezerArtistId, ex.Message);
+        }
+
+        return hits;
+    }
+
+    /// <summary>An artist's most popular tracks (artist + title only -- callers resolve
+    /// each pair into a real playable Song the same way external search results are
+    /// built, so it gets a routing id, YouTube preview and star-to-download support).</summary>
+    public async Task<List<(string Artist, string Title)>> GetArtistTopTrackNamesAsync(string deezerArtistId, int limit = 5, CancellationToken ct = default)
+    {
+        var names = new List<(string, string)>();
+        if (string.IsNullOrWhiteSpace(deezerArtistId) || limit <= 0) return names;
+        try
+        {
+            using var doc = await GetJsonAsync($"{Base}/artist/{deezerArtistId}/top?limit={limit}", ct);
+            if (doc is not null
+                && doc.RootElement.TryGetProperty("data", out var data)
+                && data.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var t in data.EnumerateArray())
+                {
+                    var title = Str(t, "title");
+                    var artist = t.TryGetProperty("artist", out var art) ? Str(art, "name") : null;
+                    if (!string.IsNullOrWhiteSpace(title) && !string.IsNullOrWhiteSpace(artist))
+                        names.Add((artist!, title!));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("deezer artist top tracks '{Id}' failed: {M}", deezerArtistId, ex.Message);
+        }
+
+        return names;
     }
 
     /// <summary>Search the album catalog. Single-track "albums" are dropped: a plain
@@ -202,9 +298,6 @@ public class DeezerMetadataService
     public async Task<List<AlbumHit>> SearchAlbumsAsync(string query, int limit, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(query) || limit <= 0) return new List<AlbumHit>();
-        var key = $"{query}|{limit}".ToLowerInvariant();
-        if (_albumSearchCache.TryGetValue(key, out var cached)) return cached;
-
         var hits = new List<AlbumHit>();
         try
         {
@@ -240,7 +333,6 @@ public class DeezerMetadataService
             _logger.LogDebug("deezer album search '{Q}' failed: {M}", query, ex.Message);
         }
 
-        Cache(_albumSearchCache, key, hits);
         return hits;
     }
 
@@ -249,9 +341,6 @@ public class DeezerMetadataService
     public async Task<string?> FindAlbumIdAsync(string? artist, string? album, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(album)) return null;
-        var key = $"{artist}|{album}".ToLowerInvariant();
-        if (_albumIdCache.TryGetValue(key, out var cached)) return cached;
-
         string? id = null;
         try
         {
@@ -269,7 +358,6 @@ public class DeezerMetadataService
             _logger.LogDebug("deezer album id lookup '{A} - {Al}' failed: {M}", artist, album, ex.Message);
         }
 
-        Cache(_albumIdCache, key, id);
         return id;
     }
 
@@ -279,8 +367,6 @@ public class DeezerMetadataService
     public async Task<AlbumDetail?> GetAlbumDetailAsync(string deezerId, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(deezerId)) return null;
-        if (_albumDetailCache.TryGetValue(deezerId, out var cached)) return cached;
-
         AlbumDetail? detail = null;
         try
         {
@@ -307,7 +393,7 @@ public class DeezerMetadataService
                 }
             }
 
-            if (string.IsNullOrWhiteSpace(title)) { Cache(_albumDetailCache, deezerId, null); return null; }
+            if (string.IsNullOrWhiteSpace(title)) return null;
 
             var tracks = new List<AlbumTrack>();
             using (var doc = await GetJsonAsync($"{Base}/album/{deezerId}/tracks?limit=300", ct))
@@ -350,14 +436,14 @@ public class DeezerMetadataService
             _logger.LogDebug("deezer album detail {Id} failed: {M}", deezerId, ex.Message);
         }
 
-        Cache(_albumDetailCache, deezerId, detail);
         return detail;
     }
 
     private Task<int?> AlbumYearAsync(long albumId, CancellationToken ct)
     {
-        if (_albumYearCache.TryGetValue(albumId, out var y)) return Task.FromResult(y);
-        // Shared across concurrent callers for the same album id (single-flight).
+        // Shared across concurrent callers for the same album id (single-flight);
+        // the entry is removed the instant it resolves, so this only collapses
+        // simultaneous requests and never serves a stale result to a later search.
         return _albumYearTasks.GetOrAdd(albumId,
             id => new Lazy<Task<int?>>(() => FetchAlbumYearAsync(id))).Value;
     }
@@ -373,7 +459,6 @@ public class DeezerMetadataService
                 year = yr;
         }
         catch { /* best-effort */ }
-        _albumYearCache[albumId] = year;
         _albumYearTasks.TryRemove(albumId, out _);
         return year;
     }
@@ -400,9 +485,4 @@ public class DeezerMetadataService
     private static int? Int(JsonElement e, string name)
         => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : (int?)null;
 
-    private static void Cache<TK, TV>(ConcurrentDictionary<TK, TV> cache, TK key, TV val) where TK : notnull
-    {
-        cache[key] = val;
-        if (cache.Count > MaxCache) cache.Clear();  // crude bound; simple and safe
-    }
 }

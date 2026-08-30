@@ -48,15 +48,40 @@ public class SoulseekMetadataService : IMusicMetadataService
         return SearchSongsByArtistTitleAsync(queryArtist, queryTitle ?? query, 1);
     }
 
-    public Task<List<Song>> SearchSongsByArtistTitleAsync(string artist, string title, int limit = 1, int? durationSeconds = null)
+    public async Task<List<Song>> SearchSongsByArtistTitleAsync(string artist, string title, int limit = 1, int? durationSeconds = null)
     {
         if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title))
-            return Task.FromResult(new List<Song>());
+            return new List<Song>();
 
         // INSTANT placeholder. We do NOT call YouTube here — at queue-build time we'd
         // rate-limit ourselves into oblivion (Arpeggio fans out 5-10 search3 calls
         // per radio session). YouTube resolution is deferred to /rest/stream where
         // it happens once per actual playback, sequentially as the user advances.
+        //
+        // Last.fm's similar-tracks API (our only caller with durationSeconds unset)
+        // never returns a duration. Left unresolved, that used to fall through to a
+        // flat 180s guess with no length verification downstream, which let YouTube
+        // matching land on a wrong/long video (e.g. a full-album upload) — the extra
+        // runtime after the real song ends was literally the next track(s) in that
+        // same video, and the mismatch cascaded to whatever got skipped to next.
+        // Deezer's search API is free, keyless, and fast enough to call inline here
+        // (unlike yt-dlp, it isn't the rate-limit risk the comment above warns about),
+        // so resolve the real duration now: it fixes the displayed scrub bar AND
+        // gives the later YouTube search a duration hint to match against instead of
+        // taking its blind top result.
+        if (durationSeconds is null)
+        {
+            try
+            {
+                var meta = await _deezer.EnrichTrackAsync(artist, title, includeYear: false);
+                if (meta?.Duration is int dd && dd > 0) durationSeconds = dd;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Deezer duration lookup failed for '{Artist} - {Title}'", artist, title);
+            }
+        }
+
         var externalId = _idRegistry.Register(new SoulseekRouting
         {
             // YouTubeId intentionally null — resolved lazily on play.
@@ -68,12 +93,12 @@ public class SoulseekMetadataService : IMusicMetadataService
         _logger.LogDebug("Placeholder song registered for '{Artist} - {Title}' (dur={Dur}) -> id {Id}",
             artist, title, durationSeconds, externalId);
 
-        // 180 is the fallback when we don't know the real duration — most songs
-        // are 3-5 min so it's a less-bad guess than 0 (which would prevent
+        // 180 is the last-resort fallback when Last.fm AND Deezer both have nothing —
+        // most songs are 3-5 min so it's a less-bad guess than 0 (which would prevent
         // clients from rendering a scrub bar at all).
         var effectiveDuration = durationSeconds ?? 180;
 
-        return Task.FromResult(new List<Song>
+        return new List<Song>
         {
             new Song
             {
@@ -86,7 +111,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 ExternalProvider = ProviderName,
                 ExternalId = externalId
             }
-        });
+        };
     }
 
     // Cap Deezer calls per search so a big result set (Feishin requests up to 200)
@@ -132,7 +157,7 @@ public class SoulseekMetadataService : IMusicMetadataService
 
     public async Task ResolveTopDurationsAsync(List<Song> songs, CancellationToken ct = default)
     {
-        var sem = new SemaphoreSlim(6);
+        var sem = new SemaphoreSlim(8);
         var tasks = songs.Where(s => !s.IsLocal).Take(TopDurationResolveLimit).Select(async song =>
         {
             await sem.WaitAsync(ct);
@@ -263,8 +288,31 @@ public class SoulseekMetadataService : IMusicMetadataService
         return albums;
     }
 
-    public Task<List<Artist>> SearchArtistsAsync(string query, int limit = 20)
-        => Task.FromResult(new List<Artist>());
+    public async Task<List<Artist>> SearchArtistsAsync(string query, int limit = 20)
+    {
+        var hits = await _deezer.SearchArtistsAsync(query, limit);
+        var artists = new List<Artist>();
+        foreach (var hit in hits)
+        {
+            var id = _idRegistry.Register(new SoulseekRouting
+            {
+                Kind = RoutingKind.Artist,
+                Artist = hit.Name,
+                ExternalAlbumId = null,
+            });
+            artists.Add(new Artist
+            {
+                Id = id,
+                Name = hit.Name,
+                ImageUrl = hit.ImageUrl,
+                AlbumCount = hit.AlbumCount,
+                IsLocal = false,
+                ExternalProvider = ProviderName,
+                ExternalId = id,
+            });
+        }
+        return artists;
+    }
 
     public async Task<SearchResult> SearchAllAsync(string query, int songLimit = 20, int albumLimit = 20, int artistLimit = 20)
     {
@@ -413,8 +461,120 @@ public class SoulseekMetadataService : IMusicMetadataService
         };
     }
 
-    public Task<List<Album>> GetArtistAlbumsAsync(string externalProvider, string externalId)
-        => Task.FromResult(new List<Album>());
+    public async Task<List<Album>> GetArtistAlbumsAsync(string externalProvider, string externalId)
+    {
+        if (!string.Equals(externalProvider, ProviderName, StringComparison.OrdinalIgnoreCase))
+            return new List<Album>();
+
+        var routing = _idRegistry.Lookup(externalId);
+        var artistName = routing?.Artist;
+        if (string.IsNullOrWhiteSpace(artistName)) return new List<Album>();
+
+        // The artist routing only ever carries a name, never a Deezer artist id, so
+        // resolve one here the same way EnrichArtistAsync does for artwork/bio.
+        var artistHits = await _deezer.SearchArtistsAsync(artistName, 1);
+        var deezerHits = artistHits.Count > 0
+            ? await _deezer.GetArtistAlbumsAsync(artistHits[0].DeezerId)
+            : new List<DeezerMetadataService.AlbumHit>();
+
+        if (deezerHits.Count == 0)
+        {
+            // Collab/feature credits ("Bryson Tiller & Pentatonix", "Rihanna feat.
+            // Bryson Tiller") actually exist as their own (albumless) Deezer artist
+            // entity, so the exact-name search "succeeds" with a real hit that just
+            // has nothing on it. Retry with just the primary name before giving up.
+            var primary = PrimaryArtistName(artistName);
+            if (primary != artistName)
+            {
+                var primaryHits = await _deezer.SearchArtistsAsync(primary, 1);
+                if (primaryHits.Count > 0)
+                    deezerHits = await _deezer.GetArtistAlbumsAsync(primaryHits[0].DeezerId);
+            }
+        }
+        var albums = new List<Album>(deezerHits.Count);
+
+        foreach (var hit in deezerHits)
+        {
+            var albumId = _idRegistry.Register(new SoulseekRouting
+            {
+                Kind = RoutingKind.Album,
+                Artist = artistName,
+                Album = hit.Title,
+                ExternalAlbumId = hit.DeezerId,
+            });
+
+            albums.Add(new Album
+            {
+                Id = albumId,
+                Title = hit.Title,
+                Artist = artistName,
+                ArtistId = externalId,
+                Year = hit.Year,
+                SongCount = hit.TrackCount,
+                CoverArtUrl = hit.CoverUrl,
+                IsLocal = false,
+                ExternalProvider = ProviderName,
+                ExternalId = albumId,
+            });
+        }
+
+        return albums;
+    }
+
+    /// <summary>An artist's most popular tracks (default top 5), resolved into real
+    /// playable Songs the same way external search results are -- each Deezer
+    /// artist/title pair is run through the normal song-search path so it gets a
+    /// proper routing id, YouTube preview, and star-to-download support.</summary>
+    public async Task<List<Song>> GetArtistTopSongsAsync(string externalProvider, string externalId, int limit = 5)
+    {
+        if (!string.Equals(externalProvider, ProviderName, StringComparison.OrdinalIgnoreCase))
+            return new List<Song>();
+
+        var routing = _idRegistry.Lookup(externalId);
+        var artistName = routing?.Artist;
+        if (string.IsNullOrWhiteSpace(artistName)) return new List<Song>();
+
+        var artistHits = await _deezer.SearchArtistsAsync(artistName, 1);
+        var topNames = artistHits.Count > 0
+            ? await _deezer.GetArtistTopTrackNamesAsync(artistHits[0].DeezerId, limit)
+            : new List<(string, string)>();
+
+        if (topNames.Count == 0)
+        {
+            var primary = PrimaryArtistName(artistName);
+            if (primary != artistName)
+            {
+                var primaryHits = await _deezer.SearchArtistsAsync(primary, 1);
+                if (primaryHits.Count > 0)
+                    topNames = await _deezer.GetArtistTopTrackNamesAsync(primaryHits[0].DeezerId, limit);
+            }
+        }
+        var songs = new List<Song>(topNames.Count);
+        foreach (var (artist, title) in topNames)
+        {
+            var hits = await SearchSongsByArtistTitleAsync(artist, title, 1);
+            if (hits.Count > 0) songs.Add(hits[0]);
+        }
+
+        return songs;
+    }
+
+    // Splits on the common ways a "song artist" credit names more than one act, and
+    // returns the first (primary) one. Order matters: "feat."/"featuring" must be
+    // checked before the bare "x"/"&" separators, or "X" inside a genuine artist
+    // name (rare, but happens) could get misread as a separator.
+    private static readonly string[] CollabSeparators =
+        { " featuring ", " feat. ", " feat ", " ft. ", " ft ", " & ", " x ", " X ", ", " };
+
+    private static string PrimaryArtistName(string artistName)
+    {
+        foreach (var sep in CollabSeparators)
+        {
+            var idx = artistName.IndexOf(sep, StringComparison.OrdinalIgnoreCase);
+            if (idx > 0) return artistName[..idx].Trim();
+        }
+        return artistName;
+    }
 
     public Task<List<ExternalPlaylist>> SearchPlaylistsAsync(string query, int limit = 20)
         => Task.FromResult(new List<ExternalPlaylist>());

@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Options;
 using Octo.Models.Domain;
 using Octo.Models.Settings;
 using Octo.Services.Common;
 using Octo.Services.Local;
+using Octo.Services.Metadata;
 using Octo.Services.Subsonic;
 using Octo.Services.YouTube;
 using IOFile = System.IO.File;
@@ -22,9 +24,35 @@ public class SoulseekDownloadService : BaseDownloadService
     private readonly SoulseekSettings _settings;
     private readonly YouTubeResolver _youtube;
     private readonly ExternalIdRegistry _idRegistry;
+    private readonly DeezerMetadataService _deezer;
     private readonly HttpClient _httpClient;
 
+    // Fragmented albums: each track used to be searched and awarded to a peer
+    // completely independently, so a 12-track album could land with track 3 from
+    // a 2016 remaster, track 7 from the 2010 original, and track 9 missing
+    // outright because that one track's peer attempts all failed — different
+    // rips, different tags/quality, sometimes gaps. Real Soulseek uploaders
+    // almost always share a whole album as one folder, so once ANY track in an
+    // album lands from a given peer, every subsequent track for that same album
+    // tries that SAME peer's copy first (see RankCandidates). This key ->
+    // username cache is what remembers the winning peer between tracks.
+    // Process-lifetime only (an album finishes within one background download
+    // run), no eviction needed.
+    private readonly ConcurrentDictionary<string, string> _albumPreferredPeer = new();
+
     protected override string ProviderName => SoulseekMetadataService.ProviderName;
+
+    // Deezer's album id when known, else a normalized artist+album pair — either
+    // is stable across every track of the same album and absent for a standalone
+    // single (no cross-track consistency to enforce there).
+    private static string? AlbumKey(SoulseekRouting routing)
+    {
+        if (!string.IsNullOrEmpty(routing.ExternalAlbumId))
+            return $"id:{routing.ExternalAlbumId}";
+        if (!string.IsNullOrEmpty(routing.Artist) && !string.IsNullOrEmpty(routing.Album))
+            return $"na:{routing.Artist.Trim().ToLowerInvariant()}|{routing.Album.Trim().ToLowerInvariant()}";
+        return null;
+    }
 
     public SoulseekDownloadService(
         IConfiguration configuration,
@@ -35,6 +63,7 @@ public class SoulseekDownloadService : BaseDownloadService
         SoulseekClient slskd,
         YouTubeResolver youtube,
         ExternalIdRegistry idRegistry,
+        DeezerMetadataService deezer,
         IHttpClientFactory httpClientFactory,
         NavidromeIdentityService navIdentity,
         DownloadHistoryService history,
@@ -46,6 +75,7 @@ public class SoulseekDownloadService : BaseDownloadService
         _settings = soulseekSettings.Value;
         _youtube = youtube;
         _idRegistry = idRegistry;
+        _deezer = deezer;
         _httpClient = httpClientFactory.CreateClient();
         _httpClient.Timeout = TimeSpan.FromMinutes(10);
     }
@@ -82,6 +112,39 @@ public class SoulseekDownloadService : BaseDownloadService
         });
     }
 
+    // Last.fm's similar-tracks API never returns a duration, so radio-queued
+    // placeholders reach here with routing.Duration == null. Searching YouTube
+    // without a duration hint falls back to the shim's blind ytsearch1 top hit
+    // with no length verification, which is how a "full album" or looped/mix
+    // upload gets matched instead of the real single — the extra runtime after
+    // the real song ends is literally the next track(s) in that same video.
+    // Deezer's search API is free, keyless, and returns exact track duration,
+    // so resolve it here once and cache on the shared routing object (same
+    // pattern as the YouTubeId cache below) before asking yt-dlp to search —
+    // that steers it onto the closest-of-5-candidates path instead of the
+    // unverified single-result path. 180s (typical song length) is the last
+    // resort only if Deezer has no match either.
+    private async Task<int> GetOrResolveDurationHintAsync(SoulseekRouting routing, CancellationToken cancellationToken)
+    {
+        if (routing.Duration is int d && d > 0) return d;
+
+        try
+        {
+            var meta = await _deezer.EnrichTrackAsync(routing.Artist, routing.Title, includeYear: false, ct: cancellationToken);
+            if (meta?.Duration is int dd && dd > 0)
+            {
+                routing.Duration = dd;
+                return dd;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Deezer duration lookup failed for '{Artist} - {Title}'", routing.Artist, routing.Title);
+        }
+
+        return 180;
+    }
+
     // =========================================================================
     // Streaming path (every play of an unowned radio track)
     // =========================================================================
@@ -97,7 +160,8 @@ public class SoulseekDownloadService : BaseDownloadService
         var videoId = routing.YouTubeId;
         if (string.IsNullOrEmpty(videoId) && routing.HasArtistTitle)
         {
-            var hit = await _youtube.SearchAsync($"{routing.Artist} {routing.Title}", routing.Duration, cancellationToken);
+            var durationHint = await GetOrResolveDurationHintAsync(routing, cancellationToken);
+            var hit = await _youtube.SearchAsync($"{routing.Artist} {routing.Title}", durationHint, cancellationToken);
             videoId = hit?.VideoId;
             // Cache back on the routing so a second click on the same placeholder
             // skips the yt-dlp ytsearch1: round trip — that 3-8s saving is the
@@ -180,7 +244,8 @@ public class SoulseekDownloadService : BaseDownloadService
         var videoId = routing.YouTubeId;
         if (string.IsNullOrEmpty(videoId))
         {
-            var hit = await _youtube.SearchAsync($"{routing.Artist} {routing.Title}", routing.Duration, cancellationToken);
+            var durationHint = await GetOrResolveDurationHintAsync(routing, cancellationToken);
+            var hit = await _youtube.SearchAsync($"{routing.Artist} {routing.Title}", durationHint, cancellationToken);
             videoId = hit?.VideoId;
             if (!string.IsNullOrEmpty(videoId)) routing.YouTubeId = videoId;
         }
@@ -219,10 +284,15 @@ public class SoulseekDownloadService : BaseDownloadService
         var cleanTitle = NormalizeTitle(routing.Title!, routing.Artist!);
         var primaryQuery = $"{routing.Artist} {cleanTitle}".Trim();
 
+        var albumKey = AlbumKey(routing);
+        var preferredPeer = albumKey != null && _albumPreferredPeer.TryGetValue(albumKey, out var pp) ? pp : null;
+        if (preferredPeer != null)
+            Logger.LogInformation("Album '{Album}' has a preferred peer from an earlier track: {User}", routing.Album, preferredPeer);
+
         Logger.LogInformation("Soulseek search-for-star: '{Query}'", primaryQuery);
         var hits = await _slskd.SearchAsync(primaryQuery, _settings.MinFileSizeBytes > 0 ? 30 : 10, cancellationToken);
 
-        var ranked = RankCandidates(hits, routing.Title!);
+        var ranked = RankCandidates(hits, routing.Title!, preferredPeer);
 
         // Fallback search: if the artist+title combo returned nothing usable,
         // try with just the cleaned title. Catches cases where the Last.fm
@@ -232,7 +302,7 @@ public class SoulseekDownloadService : BaseDownloadService
         {
             Logger.LogInformation("Soulseek primary query returned no usable hits; retrying with title-only");
             hits = await _slskd.SearchAsync(cleanTitle, _settings.MinFileSizeBytes > 0 ? 30 : 10, cancellationToken);
-            ranked = RankCandidates(hits, routing.Title!);
+            ranked = RankCandidates(hits, routing.Title!, preferredPeer);
         }
 
         if (ranked.Count == 0)
@@ -278,6 +348,12 @@ public class SoulseekDownloadService : BaseDownloadService
                 localPath = MoveToConfiguredLayout(localPath, routing) ?? localPath;
                 Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}): {Path}",
                     attemptIdx, state, localPath);
+
+                // Remember this peer for the rest of the album so later tracks try
+                // them first instead of landing on an unrelated release/rip.
+                if (albumKey != null)
+                    _albumPreferredPeer[albumKey] = hit.Username;
+
                 return localPath;
             }
 
@@ -445,12 +521,18 @@ public class SoulseekDownloadService : BaseDownloadService
         return t;
     }
 
-    private List<SoulseekFileHit> RankCandidates(List<SoulseekFileHit> hits, string title)
+    // preferredPeer (the peer that already supplied an earlier track from this same
+    // album) is floated to the very front, ahead of the usual queue/speed ordering —
+    // matching the rest of the album beats a marginally faster stranger. It still has
+    // to pass the same extension/size/title filters as everyone else, so a peer that
+    // simply doesn't have this particular track is skipped, not force-included.
+    private List<SoulseekFileHit> RankCandidates(List<SoulseekFileHit> hits, string title, string? preferredPeer = null)
         => hits
             .Where(h => string.Equals(h.Extension, _settings.PreferredExtension, StringComparison.OrdinalIgnoreCase))
             .Where(h => h.Size >= _settings.MinFileSizeBytes)
             .Where(h => FilenamePlausiblyMatchesTitle(h.Filename, title))
-            .OrderBy(h => h.QueueLength ?? int.MaxValue)
+            .OrderBy(h => preferredPeer != null && string.Equals(h.Username, preferredPeer, StringComparison.Ordinal) ? 0 : 1)
+            .ThenBy(h => h.QueueLength ?? int.MaxValue)
             .ThenByDescending(h => h.UploadSpeed ?? 0)
             .ThenByDescending(h => h.Size)
             .Take(MaxPeerAttempts)

@@ -2,6 +2,8 @@ services:
   octorr:
     build: .
     container_name: octorr
+    extra_hosts:
+      - "planohouse.tail2f0d4c.ts.net:192.168.254.192"
     restart: unless-stopped
     ports:
       - "5274:8080"
@@ -40,7 +42,7 @@ services:
       YouTube__ShimUrl: http://yt-dlp-shim:8080
 
       # ----- slskd (Soulseek) sidecar -----
-      Soulseek__BaseUrl: http://slskd:5030
+      Soulseek__BaseUrl: http://192.168.254.192:5030
       Soulseek__Username: ${SLSKD_USERNAME:-slskd}
       Soulseek__Password: ${SLSKD_PASSWORD:-slskd}
       Soulseek__SearchWaitSeconds: ${SLSKD_SEARCH_WAIT_SECONDS:-6}
@@ -69,7 +71,15 @@ services:
     build: ./yt-dlp-shim
     container_name: yt-dlp-shim
     restart: unless-stopped
+    depends_on:
+      - bgutil-pot
     environment:
+      # Base URL of the bgutil PO-token provider sidecar below. yt-dlp's
+      # bgutil-ytdlp-pot-provider plugin (installed in the shim image) reads
+      # this via --extractor-args to fetch PO tokens for the actual
+      # googlevideo stream request, which YouTube now requires even when
+      # search/resolve metadata calls succeed without one.
+      BGUTIL_POT_BASE_URL: http://bgutil-pot:4416
       MAX_CONCURRENT_YTDLP: ${YTDLP_MAX_CONCURRENT:-5}
       SEARCH_CACHE_MAX: ${YTDLP_SEARCH_CACHE_MAX:-1024}
       URL_CACHE_MAX: ${YTDLP_URL_CACHE_MAX:-512}
@@ -86,12 +96,28 @@ services:
       # repeated on every fork, and survives container recreate. Named volume so
       # ownership is correct and `docker compose down` does not touch host paths.
       - ytdlp-cache:/root/.cache/yt-dlp
+      # YouTube session cookies (Netscape format) so extraction runs
+      # authenticated instead of anonymous - meaningfully faster and less
+      # throttled by YouTube's bot detection. Read-only, owner-only perms on host.
+      - ./yt-dlp-shim/cookies.txt:/app/cookies.txt
       # Persistent duration cache DB (see META_DB_PATH above).
       - ytshim-cache:/var/lib/ytshim
       # Shared music root so YouTube-MP3 downloads (DownloadSource=YouTube) land
       # where Navidrome scans; same host dir Octo and slskd mount, so dest paths
       # line up across containers.
       - ${DOWNLOAD_PATH:-./downloads}:/music
+
+  # PO-token provider for yt-dlp. YouTube now requires a proof-of-origin
+  # token on the actual googlevideo audio-stream request (not just
+  # search/resolve), which was causing every /stream call to 403 even
+  # though extraction succeeded. This sidecar generates valid tokens that
+  # the bgutil-ytdlp-pot-provider plugin (in yt-dlp-shim) fetches over HTTP.
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-pot
+    restart: unless-stopped
+    expose:
+      - "4416"
 
   # Soulseek client (slskd). Web UI on 5030, peer port 50300.
   # State (config, db, downloads-in-progress) persisted to ./slskd-state so the
@@ -100,11 +126,11 @@ services:
     image: slskd/slskd:latest
     container_name: slskd
     restart: unless-stopped
-    ports:
-      - "5030:5030"
-      - "50300:50300"
+    user: '1000:1000'
+    network_mode: "container:gluetun"
     environment:
       SLSKD_REMOTE_CONFIGURATION: "true"
+      SLSKD_DOWNLOADS_DIR: /music
       SLSKD_SLSK_USERNAME: ${SLSKD_SOULSEEK_USERNAME:-}
       SLSKD_SLSK_PASSWORD: ${SLSKD_SOULSEEK_PASSWORD:-}
       SLSKD_USERNAME: ${SLSKD_USERNAME:-slskd}

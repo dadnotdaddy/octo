@@ -75,3 +75,11 @@ octo/downloads/
 
 # local build artifacts
 *.tgz
+
+# Octo runtime state and secrets (never commit these)
+# cookies.txt holds live YouTube session cookies — credentials, not config.
+yt-dlp-shim/cookies.txt
+octo-config/
+slskd-state/
+*.bak
+*.bak[0-9]

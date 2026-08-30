@@ -165,17 +165,37 @@ public class LocalLibraryService : ILocalLibraryService
             // Double-check after acquiring lock
             if (_mappings != null) return _mappings;
             
-            if (File.Exists(_mappingFilePath))
+            // A truncated/corrupt mappings file must not hard-fail every lookup for
+            // the rest of the process. Same policy as DownloadHistoryService: log it
+            // and start fresh. The file is a rebuildable index of what we downloaded,
+            // not a source of truth — the audio files on disk are.
+            try
             {
-                var json = await File.ReadAllTextAsync(_mappingFilePath);
-                _mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, LocalSongMapping>>(json) 
-                            ?? new Dictionary<string, LocalSongMapping>();
+                if (File.Exists(_mappingFilePath))
+                {
+                    var json = await File.ReadAllTextAsync(_mappingFilePath);
+                    _mappings = string.IsNullOrWhiteSpace(json)
+                        ? new Dictionary<string, LocalSongMapping>()
+                        : System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, LocalSongMapping>>(json)
+                          ?? new Dictionary<string, LocalSongMapping>();
+                }
+                else
+                {
+                    _mappings = new Dictionary<string, LocalSongMapping>();
+                }
             }
-            else
+            catch (Exception ex) when (ex is JsonException or NotSupportedException)
             {
+                // ONLY unparseable content starts fresh. A transient IO error must be
+                // allowed to propagate instead: swallowing it would cache an empty
+                // dictionary, and the next RegisterDownloadedSongAsync would persist
+                // that empty map over a perfectly good file — destroying the whole
+                // index because one read happened to fail. Letting it throw leaves
+                // _mappings null so the next call simply retries the read.
+                _logger.LogWarning("Mappings file is corrupt ({Msg}); starting fresh", ex.Message);
                 _mappings = new Dictionary<string, LocalSongMapping>();
             }
-            
+
             return _mappings;
         }
         finally
@@ -187,11 +207,29 @@ public class LocalLibraryService : ILocalLibraryService
     private async Task SaveMappingsAsync(Dictionary<string, LocalSongMapping> mappings)
     {
         _mappings = mappings;
-        var json = System.Text.Json.JsonSerializer.Serialize(mappings, new System.Text.Json.JsonSerializerOptions 
-        { 
-            WriteIndented = true 
+        var json = System.Text.Json.JsonSerializer.Serialize(mappings, new System.Text.Json.JsonSerializerOptions
+        {
+            WriteIndented = true
         });
-        await File.WriteAllTextAsync(_mappingFilePath, json);
+
+        // Write-then-rename so a crash mid-write can't leave a truncated file
+        // behind: the rename is atomic, so readers see either the old complete
+        // file or the new one, never a half-written one. A write failure is
+        // logged rather than thrown — losing an index entry costs a re-download,
+        // but failing the whole download here would lose the file we just got.
+        // Unique temp name so a stale leftover from a previous crash — or another
+        // process sharing this volume — can't be picked up or half-overwritten here.
+        var tmp = $"{_mappingFilePath}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            await File.WriteAllTextAsync(tmp, json);
+            File.Move(tmp, _mappingFilePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Mappings save failed: {Msg}", ex.Message);
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* nothing more we can do */ }
+        }
     }
 
     public string GetDownloadDirectory() => _downloadDirectory;
@@ -218,7 +256,7 @@ public class LocalLibraryService : ILocalLibraryService
             // relayed login or configured admin creds). When available we send the
             // Subsonic u/t/s triplet; otherwise we fall back to the bare call, which
             // only works on servers that allow unauthenticated localhost scans.
-            var auth = _navIdentity.GetScanAuth();
+            var auth = await _navIdentity.GetScanAuthAsync();
             var url = auth is { } a
                 ? $"{_subsonicSettings.Url}/rest/startScan?f=json&c=octo&v=1.16.1" +
                   $"&u={Uri.EscapeDataString(a.user)}&t={a.token}&s={a.salt}"
