@@ -28,12 +28,17 @@ public class YouTubeResolver
 
     /// <summary>
     /// Resolves "Artist - Title" to a single best YouTube hit via the shim.
+    /// Pass <paramref name="interactive"/> when someone is actively waiting on
+    /// this (a tap on a song): the shim keeps slots reserved for that work so it
+    /// never queues behind background search enrichment, which routinely backs
+    /// up 10-20s when the client refreshes a whole library at once.
     /// </summary>
-    public async Task<YouTubeHit?> SearchAsync(string query, int? durationHint = null, CancellationToken ct = default)
+    public async Task<YouTubeHit?> SearchAsync(string query, int? durationHint = null, CancellationToken ct = default, bool interactive = false)
     {
         if (string.IsNullOrWhiteSpace(query)) return null;
         var url = $"{_baseUrl}/search?q={Uri.EscapeDataString(query)}"
-            + (durationHint is int dh && dh > 0 ? $"&duration={dh}" : "");
+            + (durationHint is int dh && dh > 0 ? $"&duration={dh}" : "")
+            + (interactive ? "&prio=1" : "");
         try
         {
             var http = _httpClientFactory.CreateClient(SearchClientName);
@@ -64,15 +69,36 @@ public class YouTubeResolver
     }
 
     /// <summary>
+    /// Pre-resolves a video's signed URL on the shim so a later /stream is a
+    /// cache hit instead of a ~3s yt-dlp launch. Fire-and-forget: a failed warm
+    /// costs nothing, the play path just resolves normally.
+    /// </summary>
+    public async Task WarmAsync(string videoId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(videoId)) return;
+        try
+        {
+            var http = _httpClientFactory.CreateClient(SearchClientName);
+            using var resp = await http.GetAsync($"{_baseUrl}/warm?id={Uri.EscapeDataString(videoId)}", ct);
+            _logger.LogDebug("shim /warm {Vid} -> {Code}", videoId, (int)resp.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("shim /warm failed for {Vid}: {Msg}", videoId, ex.Message);
+        }
+    }
+
+    /// <summary>
     /// Fast metadata-only lookup via the shim's /meta (flat search, no URL
     /// resolution). Returns the top video's id + duration for showing an accurate
     /// length without paying the full /search extraction.
     /// </summary>
-    public async Task<YouTubeHit?> MetaAsync(string query, int? durationHint = null, CancellationToken ct = default)
+    public async Task<YouTubeHit?> MetaAsync(string query, int? durationHint = null, CancellationToken ct = default, bool interactive = false)
     {
         if (string.IsNullOrWhiteSpace(query)) return null;
         var url = $"{_baseUrl}/meta?q={Uri.EscapeDataString(query)}"
-            + (durationHint is int dh && dh > 0 ? $"&duration={dh}" : "");
+            + (durationHint is int dh && dh > 0 ? $"&duration={dh}" : "")
+            + (interactive ? "&prio=1" : "");
         try
         {
             var http = _httpClientFactory.CreateClient(SearchClientName);

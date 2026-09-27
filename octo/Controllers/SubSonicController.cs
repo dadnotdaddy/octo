@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using System.Collections.Concurrent;
 using System.Xml.Linq;
 using System.Text;
 using System.Text.Json;
@@ -16,6 +17,7 @@ using Octo.Services.Subsonic;
 using Octo.Services.LastFm;
 using Octo.Services.CoverArt;
 using Octo.Services.Soulseek;
+using Octo.Services.YouTube;
 
 namespace Octo.Controllers;
 
@@ -38,6 +40,7 @@ public class SubsonicController : ControllerBase
     private readonly CoverArtService? _coverArtService;
     private readonly CoverArtAggregator? _coverArtAggregator;
     private readonly ExternalIdRegistry _idRegistry;
+    private readonly YouTubeResolver? _youtube;
     private readonly RadioQueueStore _radioQueueStore;
     private readonly NavidromeIdentityService _navIdentity;
     // Factory, not a held HttpClient: cover-art fetches hit arbitrary third-party
@@ -65,8 +68,10 @@ public class SubsonicController : ControllerBase
         LastFmService? lastFmService = null,
         ListenBrainzSimilarTracksService? listenBrainzService = null,
         CoverArtService? coverArtService = null,
-        CoverArtAggregator? coverArtAggregator = null)
+        CoverArtAggregator? coverArtAggregator = null,
+        YouTubeResolver? youtube = null)
     {
+        _youtube = youtube;
         _subsonicSettings = subsonicSettings.Value;
         _metadataService = metadataService;
         _localLibraryService = localLibraryService;
@@ -252,6 +257,21 @@ public class SubsonicController : ControllerBase
         var requestedAlbums  = int.TryParse(parameters.GetValueOrDefault("albumCount",  "20"), out var ac)  ? ac  : 20;
         var requestedArtists = int.TryParse(parameters.GetValueOrDefault("artistCount", "20"), out var arc) ? arc : 20;
 
+        // Narjo's search screen shows a short top-N of each kind, but it asks for
+        // 50/30/30 — so we were building 30 external songs it never displayed.
+        // Clamp to what it actually renders. Scoped to Narjo by client name on
+        // purpose: Arpeggi and Feishin ask for up to 200 songs and use the whole
+        // list, so a global cap would quietly truncate them.
+        const int NarjoTopN = 5;
+        var isNarjo = string.Equals(parameters.GetValueOrDefault("c", ""), "Narjo",
+            StringComparison.OrdinalIgnoreCase);
+        if (isNarjo)
+        {
+            requestedSongs   = Math.Min(requestedSongs,   NarjoTopN);
+            requestedAlbums  = Math.Min(requestedAlbums,  NarjoTopN);
+            requestedArtists = Math.Min(requestedArtists, NarjoTopN);
+        }
+
         // Always include local results. The earlier behavior special-cased
         // songCount>=200 (Arpeggi's default) to suppress local songs entirely
         // because at that time clients were using search3 as their radio
@@ -269,6 +289,17 @@ public class SubsonicController : ControllerBase
         // and the registry survives across many sessions before recycling.
         const int MaxExternalPerQuery = 150;
         var externalTarget = Math.Min(MaxExternalPerQuery, Math.Max(0, requestedSongs - localSongTarget));
+
+        // The "requested minus local" split above assumes a large songCount. Under
+        // Narjo's clamp requestedSongs is 5, which is less than the 20-song local
+        // floor, so that arithmetic would land on zero externals and leave the
+        // search screen showing only what's already in the library. Target both
+        // sides at the top-N instead.
+        if (isNarjo)
+        {
+            localSongTarget = NarjoTopN;
+            externalTarget = NarjoTopN;
+        }
 
         // External: Last.fm fan-out. We try track.search first (fuzzy matches
         // anywhere in the query), then top up with the canonical artist's top
@@ -296,7 +327,14 @@ public class SubsonicController : ControllerBase
         await _metadataService.EnrichExternalSongsAsync(externalSongs);
         if (!skipExternalHeavyWork)
         {
-            await _metadataService.ResolveTopDurationsAsync(externalSongs);
+            // Resolve EVERY external song we're about to show, not the default top 8.
+            // Mixing resolved lengths at the top of the list with Deezer's guesses
+            // below it means two songs on the same screen disagree about what a
+            // duration even means. Under the Narjo clamp that's 5 lookups, they run
+            // concurrently, and the shim caches them permanently — so the cost is one
+            // batch on a query you've never searched before, and nothing after that.
+            await _metadataService.ResolveTopDurationsAsync(
+                externalSongs, limit: isNarjo ? externalSongs.Count : null);
         }
 
         // Local pass-through. Albums/artists always get the full requested counts;
@@ -433,12 +471,31 @@ public class SubsonicController : ControllerBase
             }
         }
 
-        var songs = new List<Song>(collected.Count);
-        foreach (var (artist, title) in collected)
+        // Registering a placeholder costs a Deezer round-trip for the duration, and
+        // this loop used to await them one at a time — 30 tracks meant 30 serial
+        // round-trips and was the entire cost of a search (~6.5s of a 6.6s response).
+        // Two changes: run them concurrently, and pass resolveDuration: false because
+        // EnrichExternalSongsAsync runs immediately after this and resolves the exact
+        // same duration from the exact same provider. Select preserves order, so
+        // Last.fm's relevance ranking survives.
+        var sem = new SemaphoreSlim(8);
+        var resolved = await Task.WhenAll(collected.Select(async pair =>
         {
-            var hits = await _metadataService.SearchSongsByArtistTitleAsync(artist, title, 1);
-            if (hits.Count > 0) songs.Add(hits[0]);
-        }
+            await sem.WaitAsync();
+            try
+            {
+                var hits = await _metadataService.SearchSongsByArtistTitleAsync(
+                    pair.Artist, pair.Title, 1, durationSeconds: null, resolveDuration: false);
+                return hits.Count > 0 ? hits[0] : null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "placeholder resolve failed for {Artist} - {Title}", pair.Artist, pair.Title);
+                return null;
+            }
+            finally { sem.Release(); }
+        }));
+        var songs = resolved.Where(s => s != null).Cast<Song>().ToList();
         _logger.LogInformation("External search '{Q}' -> {N} placeholder songs", query, songs.Count);
 
         // Fire-and-forget: pre-resolve YouTube videoIds for the top hits so the
@@ -539,10 +596,17 @@ public class SubsonicController : ControllerBase
                         {
                             await directStream.AudioStream.CopyToAsync(Response.Body, HttpContext.RequestAborted);
                         }
+
+                        // Only here: the body was delivered in full without the client
+                        // bailing, so this song is genuinely healthy. Warming earlier
+                        // would put the next track's resolve in contention with the one
+                        // the user is waiting on, which is the problem, not the fix.
+                        PrefetchNextTrack(parameters.GetValueOrDefault("u", "?"), id);
                     }
                     catch (OperationCanceledException)
                     {
-                        // Client disconnected mid-stream. Normal — don't log as error.
+                        // Client disconnected mid-stream. Normal — don't log as error,
+                        // and don't prefetch: nothing here indicates a healthy play.
                     }
                     return new EmptyResult();
                 }
@@ -1257,6 +1321,23 @@ public class SubsonicController : ControllerBase
         // send an entire album down the single-track download path. ParseSongId still
         // supplies the provider string.
         var albumCandidate = !string.IsNullOrEmpty(itemId) ? itemId : parameters.GetValueOrDefault("albumId", "");
+
+        // A star on an albumId we don't recognise as an external album falls through
+        // to the plain Navidrome relay below, which answers "starred" and downloads
+        // nothing. That is right for a genuine local album and silently wrong for
+        // everything else, and there was no way to tell the two apart from the logs.
+        // Most common cause: a partially-downloaded album now exists locally, so the
+        // client is offering that row's id instead of the external album's.
+        if (!string.IsNullOrEmpty(albumCandidate)
+            && parameters.ContainsKey("albumId")
+            && _idRegistry.Lookup(albumCandidate)?.Kind != RoutingKind.Album)
+        {
+            _logger.LogWarning(
+                "Star on albumId {AlbumId} is not a known external album — relaying to Navidrome and "
+                + "downloading nothing. If this album is incomplete, re-star it from a fresh search result.",
+                albumCandidate);
+        }
+
         if (!string.IsNullOrEmpty(albumCandidate)
             && _idRegistry.Lookup(albumCandidate)?.Kind == RoutingKind.Album)
         {
@@ -1861,6 +1942,103 @@ public class SubsonicController : ControllerBase
         return _responseBuilder.CreateResponse(format, "artistInfo2", new { });
     }
 
+    /// <summary>
+    /// Last play queue each client reported via savePlayQueue, so a finished
+    /// stream knows which track is next. In-memory and tiny by design: it is a
+    /// latency optimization, and losing it on restart costs one slow play.
+    /// </summary>
+    private static class PlayQueueTracker
+    {
+        private static readonly ConcurrentDictionary<string, string[]> Queues = new();
+
+        public static void Set(string user, string[] ids)
+        {
+            if (ids.Length == 0) Queues.TryRemove(user, out _);
+            else Queues[user] = ids;
+        }
+
+        /// <summary>Track after <paramref name="currentId"/>, or null at the end/unknown.</summary>
+        public static string? NextAfter(string user, string currentId)
+        {
+            if (!Queues.TryGetValue(user, out var ids)) return null;
+            var i = Array.FindIndex(ids, x => string.Equals(x, currentId, StringComparison.Ordinal));
+            return i >= 0 && i + 1 < ids.Length ? ids[i + 1] : null;
+        }
+    }
+
+    /// <summary>
+    /// Records the ids from a savePlayQueue call. The ids arrive as a repeated
+    /// `id` parameter, which the flattened parameter dictionary collapses to a
+    /// single value — so read the multi-valued form/query directly.
+    /// </summary>
+    private void CapturePlayQueue(string user)
+    {
+        try
+        {
+            var ids = Request.Query["id"];
+            if (ids.Count == 0 && Request.HasFormContentType)
+            {
+                ids = Request.Form["id"];
+            }
+            if (ids.Count == 0) return;
+
+            var list = ids.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToArray();
+            PlayQueueTracker.Set(user, list);
+            _logger.LogDebug("play queue captured for {User}: {Count} tracks", user, list.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "play queue capture failed");
+        }
+    }
+
+    /// <summary>
+    /// Warms the NEXT queued track's signed URL after the current one has
+    /// finished streaming cleanly. Deliberately fire-and-forget and background
+    /// priority: the whole point is that it happens once the user already has
+    /// audio, so it can never be what they are waiting on. Without this a cold
+    /// play costs a ~3s yt-dlp resolve; with it the next track is a cache hit.
+    /// </summary>
+    private void PrefetchNextTrack(string user, string currentId)
+    {
+        if (_youtube is null) return;
+
+        var nextId = PlayQueueTracker.NextAfter(user, currentId);
+        if (string.IsNullOrEmpty(nextId)) return;
+
+        var (isExternal, _, nextExternalId) = _localLibraryService.ParseSongId(nextId);
+        if (!isExternal || string.IsNullOrEmpty(nextExternalId)) return;  // local files need no warm
+
+        var routing = _idRegistry.Lookup(nextExternalId);
+        if (routing is null || !routing.HasArtistTitle) return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                var videoId = routing.YouTubeId;
+                if (string.IsNullOrEmpty(videoId))
+                {
+                    var hit = await _youtube.SearchAsync(
+                        $"{routing.Artist} {routing.Title}", routing.Duration, cts.Token);
+                    videoId = hit?.VideoId;
+                    if (!string.IsNullOrEmpty(videoId)) routing.YouTubeId = videoId;
+                }
+                if (string.IsNullOrEmpty(videoId)) return;
+
+                await _youtube.WarmAsync(videoId, cts.Token);
+                _logger.LogInformation(
+                    "Prefetched next track '{Artist} - {Title}' (vid={Vid})",
+                    routing.Artist, routing.Title, videoId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "prefetch of next track failed");
+            }
+        });
+    }
+
     [Route("{**endpoint}")]
     public async Task<IActionResult> GenericEndpoint(string endpoint)
     {
@@ -1871,6 +2049,13 @@ public class SubsonicController : ControllerBase
 
         var parameters = await ExtractAllParameters();
         var format = parameters.GetValueOrDefault("f", "xml");
+
+        // Capture before the external-id safety net below returns early: a queue
+        // full of external tracks is exactly the case prefetch exists for.
+        if (endpoint.Contains("savePlayQueue", StringComparison.OrdinalIgnoreCase))
+        {
+            CapturePlayQueue(parameters.GetValueOrDefault("u", "?"));
+        }
 
         // Safety net (client-agnostic): any endpoint we don't explicitly handle,
         // called with one of our external ids, would relay to Navidrome and come

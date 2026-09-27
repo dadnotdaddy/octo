@@ -27,8 +27,13 @@ public interface IMusicMetadataService
     /// artists like "The Beatles" into artist="The", title="Beatles ...".
     /// <paramref name="durationSeconds"/> if known is stored on the placeholder
     /// so the client's scrub bar shows the right total length on first play.
+    /// When it is not known the provider looks the duration up, which costs a
+    /// network round-trip per song. Callers that follow up with
+    /// <see cref="EnrichExternalSongsAsync"/> — which resolves the same duration
+    /// from the same provider, in parallel — should pass
+    /// <paramref name="resolveDuration"/>: false to skip the duplicate lookup.
     /// </summary>
-    Task<List<Song>> SearchSongsByArtistTitleAsync(string artist, string title, int limit = 1, int? durationSeconds = null);
+    Task<List<Song>> SearchSongsByArtistTitleAsync(string artist, string title, int limit = 1, int? durationSeconds = null, bool resolveDuration = true);
 
     /// <summary>
     /// Fills in real duration/album/year on external placeholder songs (which
@@ -42,8 +47,11 @@ public interface IMusicMetadataService
     /// Resolves the real YouTube video (and its duration) for the top of a search
     /// result so the shown length matches the audio that plays. Bounded + cached;
     /// also stores the videoId so playback reuses the same video.
+    /// <paramref name="limit"/> overrides the default bound. Pass the full result
+    /// count when every song in the response is going to be displayed, so the list
+    /// doesn't mix resolved lengths at the top with provider guesses further down.
     /// </summary>
-    Task ResolveTopDurationsAsync(List<Song> songs, CancellationToken ct = default)
+    Task ResolveTopDurationsAsync(List<Song> songs, CancellationToken ct = default, int? limit = null)
         => Task.CompletedTask;
 
     /// <summary>

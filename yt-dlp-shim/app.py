@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import threading
@@ -125,6 +126,19 @@ def _url_cache_evict(video_id: str):
 # Cap concurrent yt-dlp processes globally. Each one is fork+exec heavy;
 # letting them stack starves a small container.
 _GATE = threading.Semaphore(int(os.environ.get("MAX_CONCURRENT_YTDLP", "5")))
+
+# One flat pool meant the song you TAPPED competed with every song you didn't.
+# A single play was measured taking 10.65s to produce a URL while 17 background
+# yt-dlp processes (search-time duration lookups, prewarm, radio queue) ran
+# alongside it. They never blocked on the gate — gate_wait_ms was 0 throughout —
+# they just thrashed the CPU, stretching calls that normally take ~2.5s out to
+# 5-6.6s each. So capping total concurrency is not enough; background work needs
+# its own, smaller ceiling that leaves headroom for interactive work.
+#
+# Background callers take BOTH this and _GATE; interactive callers take only
+# _GATE. That guarantees a tap never competes with more than _BG_SLOTS others.
+_BG_SLOTS = int(os.environ.get("MAX_CONCURRENT_YTDLP_BACKGROUND", "2"))
+_BG_GATE = threading.Semaphore(_BG_SLOTS)
 # Max time a queued request will wait for a free slot. Long enough that a
 # burst of 10 parallel radio-resolution searches all eventually succeed
 # rather than dropping requests on the floor.
@@ -136,14 +150,26 @@ log = logging.getLogger("ytdlp-shim")
 app = Flask(__name__)
 
 
-def _run(args: list[str], timeout: int = 20, label: str = "ytdlp") -> Optional[str]:
+def _run(args: list[str], timeout: int = 20, label: str = "ytdlp",
+         interactive: bool = False) -> Optional[str]:
     """Run yt-dlp with a hard timeout. Returns stdout or None on any failure.
+
+    `interactive=True` marks work a user is actively waiting on (resolving the
+    track they just pressed play on). Those skip the background sub-gate, so
+    speculative work can never crowd out a tap. Everything else defaults to
+    background.
 
     Logs gate-wait and wall time so a real box can show whether interactive
     resolves are queuing behind background prewarm (grep `gate_wait_ms`).
     """
     t_acquire = time.monotonic()
+    if not interactive:
+        if not _BG_GATE.acquire(timeout=_GATE_WAIT_SEC):
+            log.warning("yt-dlp bg gate full after %ds, dropping (%s)", _GATE_WAIT_SEC, label)
+            return None
     if not _GATE.acquire(timeout=_GATE_WAIT_SEC):
+        if not interactive:
+            _BG_GATE.release()
         log.warning("yt-dlp gate full after %ds, dropping: %s", _GATE_WAIT_SEC, " ".join(args))
         return None
     gate_ms = (time.monotonic() - t_acquire) * 1000.0
@@ -172,13 +198,16 @@ def _run(args: list[str], timeout: int = 20, label: str = "ytdlp") -> Optional[s
             log.warning("yt-dlp timed out (%s, gate_wait_ms=%.0f): %s", label, gate_ms, " ".join(args))
             return None
         wall_ms = (time.monotonic() - t_run) * 1000.0
-        log.info("ytdlp label=%s gate_wait_ms=%.0f wall_ms=%.0f rc=%d", label, gate_ms, wall_ms, cp.returncode)
+        log.info("ytdlp label=%s prio=%s gate_wait_ms=%.0f wall_ms=%.0f rc=%d",
+                 label, "interactive" if interactive else "bg", gate_ms, wall_ms, cp.returncode)
         if cp.returncode != 0:
             log.warning("yt-dlp exit %d (%s): %s", cp.returncode, label, cp.stderr.strip()[:300])
             return None
         return cp.stdout
     finally:
         _GATE.release()
+        if not interactive:
+            _BG_GATE.release()
 
 
 @app.get("/health")
@@ -195,12 +224,18 @@ def search():
     hint_str = request.args.get("duration", "").strip()
     duration_hint = int(hint_str) if hint_str.isdigit() else None
 
+    # prio=1 marks work a user is actively waiting on (a tap on a song). Octo
+    # sets it only on the playback path. Without it a play request queues on the
+    # same gate as background enrichment and waits 10-20s behind it.
+    interactive = request.args.get("prio", "") == "1"
+
     cache_key = f"{q.lower()}|{duration_hint or ''}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return jsonify(**cached)
 
-    payload = _search_with_hint(q, duration_hint) if duration_hint is not None else _search_single(q)
+    payload = (_search_with_hint(q, duration_hint, interactive)
+               if duration_hint is not None else _search_single(q, interactive))
     if payload is None:
         return jsonify(error="search_failed"), 502
     if not payload.get("video_id"):
@@ -219,7 +254,7 @@ def _payload_from(data: dict) -> dict:
     }
 
 
-def _search_single(q: str) -> Optional[dict]:
+def _search_single(q: str, interactive: bool = False) -> Optional[dict]:
     """No duration hint: fast path. One extraction yields metadata AND the
     stream URL, which we warm into the URL cache so /stream is a cache hit."""
     out = _run(
@@ -232,6 +267,7 @@ def _search_single(q: str) -> Optional[dict]:
         ],
         timeout=15,
         label="search+resolve",
+        interactive=interactive,
     )
     if out is None:
         return None
@@ -261,7 +297,7 @@ def _search_single(q: str) -> Optional[dict]:
     return payload
 
 
-def _search_with_hint(q: str, duration_hint: int) -> Optional[dict]:
+def _search_with_hint(q: str, duration_hint: int, interactive: bool = False) -> Optional[dict]:
     """Duration hint present: pick the closest-length of 5 flat candidates
     (cheap, no per-video extraction), then resolve the winner's URL once."""
     out = _run(
@@ -272,6 +308,7 @@ def _search_with_hint(q: str, duration_hint: int) -> Optional[dict]:
         ],
         timeout=20,
         label="search5",
+        interactive=interactive,
     )
     if out is None:
         return None
@@ -295,7 +332,9 @@ def _search_with_hint(q: str, duration_hint: int) -> Optional[dict]:
     payload = _payload_from(candidates[0])
     if payload.get("video_id"):
         # Warm the URL cache for the coming /stream (single-flight + cached).
-        _resolve_url(payload["video_id"])
+        # Inherits the caller's priority: on the playback path this resolve is
+        # the last thing standing between the tap and audio.
+        _resolve_url(payload["video_id"], interactive=interactive)
     return payload
 
 
@@ -380,6 +419,7 @@ def meta():
         abort(400, "missing q")
     hint_str = request.args.get("duration", "").strip()
     duration_hint = int(hint_str) if hint_str.isdigit() else None
+    interactive = request.args.get("prio", "") == "1"
 
     key = _norm_q(q)
     # Hot front: exact repeat within this process.
@@ -398,7 +438,7 @@ def meta():
 
     if duration_hint is not None:
         out = _run([f"ytsearch5:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
-                   timeout=20, label="meta5")
+                   timeout=20, label="meta5", interactive=interactive)
         cands = []
         for ln in (out or "").strip().split("\n"):
             ln = ln.strip()
@@ -414,7 +454,7 @@ def meta():
         data = cands[0]
     else:
         out = _run([f"ytsearch1:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
-                   timeout=15, label="meta")
+                   timeout=15, label="meta", interactive=interactive)
         if out is None:
             return jsonify(error="search_failed"), 502
         line = next((ln.strip() for ln in out.strip().split("\n") if ln.strip()), "")
@@ -436,7 +476,7 @@ def meta():
     return jsonify(**payload)
 
 
-def _resolve_url(video_id: str) -> Optional[str]:
+def _resolve_url(video_id: str, interactive: bool = False) -> Optional[str]:
     cached = _url_cache_get(video_id)
     if cached:
         return cached
@@ -459,6 +499,7 @@ def _resolve_url(video_id: str) -> Optional[str]:
                 ],
                 timeout=15,
                 label="resolve",
+                interactive=interactive,
             )
             if not out:
                 return None
@@ -479,6 +520,72 @@ def _open_upstream(url: str, headers: dict, video_id: str):
         return None
 
 
+# googlevideo throttles an OPEN-ENDED GET to roughly playback rate — measured at
+# ~31 KB/s here, so a 5 MB track took 67s and iOS gave up waiting. The exact same
+# URL asked for a bounded range (`Range: bytes=0-1048575`) serves at ~11 MB/s.
+# So never hold one long read open: walk the file in bounded range requests.
+# This is the same reason yt-dlp itself has --http-chunk-size.
+_STREAM_CHUNK = int(os.environ.get("STREAM_CHUNK_BYTES", str(4 * 1024 * 1024)))
+
+_CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.I)
+
+
+def _parse_content_range(value: str):
+    """-> (start, end, total) from a Content-Range header, or None."""
+    if not value:
+        return None
+    m = _CONTENT_RANGE_RE.match(value.strip())
+    if not m:
+        return None
+    total = None if m.group(3) == "*" else int(m.group(3))
+    return int(m.group(1)), int(m.group(2)), total
+
+
+def _parse_client_range(value: str):
+    """-> (start, end_or_None) from a client Range header, or None.
+
+    Only the single-range `bytes=start-[end]` form is handled; that is all
+    AVPlayer and the Subsonic clients ever send. A suffix range (`bytes=-500`)
+    returns None so we fall back to serving the whole body.
+    """
+    if not value:
+        return None
+    v = value.strip().lower()
+    if not v.startswith("bytes="):
+        return None
+    spec = v[6:].split(",")[0].strip()
+    if "-" not in spec or spec.startswith("-"):
+        return None
+    lo, _, hi = spec.partition("-")
+    try:
+        return int(lo), (int(hi) if hi else None)
+    except ValueError:
+        return None
+
+
+@app.get("/warm")
+def warm():
+    """Pre-resolve a video's signed URL so a later /stream is a cache hit.
+
+    Called by Octo for the NEXT track in the queue once the current one is
+    already playing, which is the whole point: the expensive part of starting a
+    song is this resolve (~3s of yt-dlp), and the signed URL expires after an
+    hour, so the track you are about to play is almost always cold. Always
+    background priority — a warm must never take a slot from someone who is
+    actually waiting on audio right now.
+    """
+    video_id = request.args.get("id", "").strip()
+    if not video_id:
+        abort(400, "missing id")
+    if _url_cache_get(video_id):
+        return jsonify(status="cached", video_id=video_id)
+    url = _resolve_url(video_id, interactive=False)
+    if not url:
+        return jsonify(error="resolve_failed", video_id=video_id), 502
+    log.info("warmed %s", video_id)
+    return jsonify(status="warmed", video_id=video_id)
+
+
 @app.get("/stream")
 def stream():
     video_id = request.args.get("id", "").strip()
@@ -486,7 +593,7 @@ def stream():
         abort(400, "missing id")
     t_enter = time.monotonic()
 
-    url = _resolve_url(video_id)
+    url = _resolve_url(video_id, interactive=True)
     if not url:
         return jsonify(error="no_audio_url"), 502
 
@@ -496,60 +603,121 @@ def stream():
     # range requests on an audio/mp4 container — without this passthrough they
     # silently drop the song from the queue. Browsers and Feishin don't care
     # about Range for short clips, hence why those clients worked anyway.
-    upstream_headers = {}
     incoming_range = request.headers.get("Range")
-    if incoming_range:
-        upstream_headers["Range"] = incoming_range
+    client_span = _parse_client_range(incoming_range)
+    want_start = client_span[0] if client_span else 0
+    want_end = client_span[1] if client_span else None   # None = "through EOF"
 
-    upstream = _open_upstream(url, upstream_headers, video_id)
-    # A signed googlevideo URL can expire between resolve and play (long or
-    # paused song, or a stale cache entry). Expiry shows up as 403/410. Evict
-    # the bad entry, re-resolve once, and retry before surfacing a failure, so
-    # one stale URL does not fail every play of this id for the cache TTL.
-    if upstream is not None and upstream.status_code in (403, 410):
-        upstream.close()
-        log.info("stream %s: signed url expired (%d), re-resolving", video_id, upstream.status_code)
-        _url_cache_evict(video_id)
-        url = _resolve_url(video_id)
-        upstream = _open_upstream(url, upstream_headers, video_id) if url else None
+    # Probe with a bounded range rather than the caller's open-ended one. This
+    # doubles as the first body chunk, so it costs no extra round-trip.
+    def _fetch(start, end, current_url):
+        hdrs = {"Range": f"bytes={start}-{end}"}
+        resp = _open_upstream(current_url, hdrs, video_id)
+        if resp is not None and resp.status_code in (403, 410):
+            # A signed googlevideo URL can expire between resolve and play (long
+            # or paused song, or a stale cache entry). Evict, re-resolve once and
+            # retry, so one stale URL doesn't fail every play for the cache TTL.
+            resp.close()
+            log.info("stream %s: signed url expired (%d), re-resolving", video_id, resp.status_code)
+            _url_cache_evict(video_id)
+            fresh = _resolve_url(video_id, interactive=True)
+            if not fresh:
+                return None, current_url
+            return _open_upstream(fresh, hdrs, video_id), fresh
+        return resp, current_url
 
-    if upstream is None or upstream.status_code not in (200, 206):
-        code = upstream.status_code if upstream is not None else "n/a"
-        if upstream is not None:
-            upstream.close()
+    first_end = want_start + _STREAM_CHUNK - 1
+    if want_end is not None:
+        first_end = min(first_end, want_end)
+    first_resp, url = _fetch(want_start, first_end, url)
+
+    if first_resp is None or first_resp.status_code not in (200, 206):
+        code = first_resp.status_code if first_resp is not None else "n/a"
+        if first_resp is not None:
+            first_resp.close()
         log.warning("stream upstream %s for %s", code, video_id)
         return jsonify(error="upstream_failed"), 502
 
+    content_type = first_resp.headers.get("Content-Type", "audio/mp4")
+    cr = _parse_content_range(first_resp.headers.get("Content-Range", ""))
+    total = cr[2] if cr else None
+
+    # If the upstream ignored the Range and handed back the whole body, there is
+    # nothing to walk — stream it straight through on the old path.
+    chunked = first_resp.status_code == 206 and cr is not None and total is not None
+    if chunked and want_end is None:
+        want_end = total - 1
+    if chunked and want_end is not None:
+        want_end = min(want_end, total - 1)
+
     @stream_with_context
     def generator():
-        first = True
+        nonlocal url
+        sent = 0
+        t_first = None
+        resp = first_resp
+        pos = want_start
         try:
-            for chunk in upstream.iter_content(chunk_size=64 * 1024):
-                if chunk:
-                    if first:
-                        log.info("stream %s ttfb_ms=%.0f status=%d",
-                                 video_id, (time.monotonic() - t_enter) * 1000.0,
-                                 upstream.status_code)
-                        first = False
+            while True:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    if t_first is None:
+                        t_first = time.monotonic()
+                        log.info("stream %s ttfb_ms=%.0f status=%d chunked=%s",
+                                 video_id, (t_first - t_enter) * 1000.0,
+                                 first_resp.status_code, chunked)
+                    sent += len(chunk)
+                    pos += len(chunk)
                     yield chunk
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                if not chunked or pos > want_end:
+                    break
+                nxt_end = min(pos + _STREAM_CHUNK - 1, want_end)
+                resp, url = _fetch(pos, nxt_end, url)
+                if resp is None or resp.status_code not in (200, 206):
+                    log.warning("stream %s: chunk at %d failed (%s); truncating",
+                                video_id, pos,
+                                resp.status_code if resp is not None else "n/a")
+                    break
+            if t_first is not None:
+                dt = max(time.monotonic() - t_first, 1e-6)
+                log.info("stream %s done bytes=%d %.0f KB/s", video_id, sent, sent / dt / 1024.0)
+        except GeneratorExit:
+            # Client hung up (skipped track, closed app). Normal.
+            raise
         finally:
             try:
-                upstream.close()
+                resp.close()
             except Exception:
                 pass
 
-    # Reflect upstream's status (200 for full body, 206 for partial). Forward
-    # the metadata that AVPlayer / Subsonic clients need to seek correctly.
+    # Reflect what the CLIENT asked for, not how we fetched it upstream. The
+    # chunking is an internal transport detail; as far as AVPlayer is concerned
+    # this is still one 200 for the whole body or one 206 for its exact range.
     headers = {
-        "Content-Type": upstream.headers.get("Content-Type", "audio/mp4"),
+        "Content-Type": content_type,
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-store",
     }
-    for h in ("Content-Length", "Content-Range"):
-        v = upstream.headers.get(h)
-        if v is not None:
-            headers[h] = v
-    return Response(generator(), headers=headers, status=upstream.status_code)
+    if chunked:
+        length = want_end - want_start + 1
+        headers["Content-Length"] = str(length)
+        if client_span is not None:
+            headers["Content-Range"] = f"bytes {want_start}-{want_end}/{total}"
+            status = 206
+        else:
+            status = 200
+    else:
+        for h in ("Content-Length", "Content-Range"):
+            v = first_resp.headers.get(h)
+            if v is not None:
+                headers[h] = v
+        status = first_resp.status_code
+    return Response(generator(), headers=headers, status=status)
 
 
 @app.get("/download")

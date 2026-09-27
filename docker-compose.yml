@@ -3,7 +3,7 @@ services:
     build: .
     container_name: octorr
     extra_hosts:
-      - "planohouse.tail2f0d4c.ts.net:192.168.254.192"
+      - "${TAILNET_HOST}:${HOST_LAN_IP}"
     restart: unless-stopped
     ports:
       - "5274:8080"
@@ -49,7 +49,7 @@ services:
       YouTube__ShimUrl: http://yt-dlp-shim:8080
 
       # ----- slskd (Soulseek) sidecar -----
-      Soulseek__BaseUrl: http://192.168.254.192:5030
+      Soulseek__BaseUrl: http://${HOST_LAN_IP}:5030
       Soulseek__Username: ${SLSKD_USERNAME:-slskd}
       Soulseek__Password: ${SLSKD_PASSWORD:-slskd}
       Soulseek__SearchWaitSeconds: ${SLSKD_SEARCH_WAIT_SECONDS:-6}
@@ -127,6 +127,39 @@ services:
     expose:
       - "4416"
 
+  # Second ProtonVPN tunnel, dedicated to slskd. Separate from the qBittorrent
+  # tunnel because Proton's two-port forwarding mode leaves one of the two
+  # mappings behind an internal port the firewall never opens; one forwarded
+  # port per tunnel is the only arrangement where both apps get working inbound.
+  # Provider mode on purpose -- gluetun selects and re-selects a US server on
+  # its own, so a single server going down does not take Soulseek with it.
+  gluetun-music:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun-music
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - SERVER_COUNTRIES=United States
+      - PORT_FORWARD_ONLY=on
+      - UPDATER_PERIOD=24h
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=10.2.0.2/32
+      - DNS_ADDRESS=10.2.0.1
+      - VPN_PORT_FORWARDING=on
+      - VPN_PORT_FORWARDING_PROVIDER=protonvpn
+      - VPN_PORT_FORWARDING_STATUS_FILE=/tmp/gluetun/forwarded_port
+      - VPN_PORT_FORWARDING_PORTS_COUNT=1
+    # slskd shares this namespace, so its web UI and peer port are published here.
+    ports:
+      - "5030:5030"
+      - "50300:50300"
+      - "50300:50300/udp"
+    restart: unless-stopped
+
   # Soulseek client (slskd). Web UI on 5030, peer port 50300.
   # State (config, db, downloads-in-progress) persisted to ./slskd-state so the
   # account survives recreate. Finished transfers land in /staging, which Octo
@@ -137,7 +170,9 @@ services:
     container_name: slskd
     restart: unless-stopped
     user: '1000:1000'
-    network_mode: "container:gluetun"
+    network_mode: "service:gluetun-music"
+    depends_on:
+      - gluetun-music
     environment:
       SLSKD_REMOTE_CONFIGURATION: "true"
       SLSKD_DOWNLOADS_DIR: /staging

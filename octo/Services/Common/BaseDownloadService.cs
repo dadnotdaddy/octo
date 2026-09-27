@@ -548,8 +548,27 @@ public abstract class BaseDownloadService : IDownloadService
         Logger.LogInformation("Found {Count} additional tracks to download for album '{AlbumTitle}'", 
             tracksToDownload.Count, album.Title);
 
+        // Counted, because "every track failed" and "every track succeeded" used to produce
+        // an identical "Completed background download" line — an album that downloaded
+        // nothing at all looked exactly like one that downloaded perfectly.
+        var succeeded = 0;
+        var failed = 0;
+        var skipped = 0;
+        const int consecutiveFailureAbort = 5;
+        var consecutiveFailures = 0;
+
         foreach (var track in tracksToDownload)
         {
+            if (consecutiveFailures >= consecutiveFailureAbort && succeeded == 0)
+            {
+                Logger.LogError(
+                    "Aborting album '{AlbumTitle}': the first {Count} tracks all failed to download. "
+                    + "The downloader is likely offline or rejecting requests — fix that, then star the album again.",
+                    album.Title, consecutiveFailures);
+                failed += tracksToDownload.Count - (succeeded + failed + skipped);
+                break;
+            }
+
             try
             {
                 EnsureRoutingRegistered(track);
@@ -558,6 +577,7 @@ public abstract class BaseDownloadService : IDownloadService
                 if (existingPath != null && IOFile.Exists(existingPath))
                 {
                     Logger.LogDebug("Track {TrackId} already downloaded, skipping", track.ExternalId);
+                    skipped++;
                     continue;
                 }
 
@@ -568,18 +588,31 @@ public abstract class BaseDownloadService : IDownloadService
                     if (activeDownload.Status == DownloadStatus.InProgress)
                     {
                         Logger.LogDebug("Track {TrackId} download already in progress, skipping", track.ExternalId);
+                        skipped++;
                         continue;
                     }
                     
                     if (activeDownload.Status == DownloadStatus.Completed)
                     {
                         Logger.LogDebug("Track {TrackId} already downloaded in this session, skipping", track.ExternalId);
+                        skipped++;
                         continue;
                     }
                 }
 
                 Logger.LogInformation("Downloading track '{Title}' from album '{Album}'", track.Title, album.Title);
-                await DownloadSongInternalAsync(ProviderName, track.ExternalId!, triggerAlbumDownload: false, CancellationToken.None, forcePermanent: true);
+                var downloadedPath = await DownloadSongInternalAsync(ProviderName, track.ExternalId!, triggerAlbumDownload: false, CancellationToken.None, forcePermanent: true);
+
+                if (string.IsNullOrEmpty(downloadedPath))
+                {
+                    failed++;
+                    consecutiveFailures++;
+                    Logger.LogWarning("Track {TrackId} '{Title}' produced no file", track.ExternalId, track.Title);
+                    continue;
+                }
+
+                succeeded++;
+                consecutiveFailures = 0;
 
                 // Force a rescan per track so the album fills in progressively in the
                 // client instead of appearing all at once at the end. The per-download
@@ -589,8 +622,21 @@ public abstract class BaseDownloadService : IDownloadService
             }
             catch (Exception ex)
             {
+                failed++;
+                consecutiveFailures++;
                 Logger.LogWarning(ex, "Failed to download track {TrackId} '{Title}'", track.ExternalId, track.Title);
             }
+        }
+
+        if (succeeded == 0 && failed > 0)
+        {
+            // Nothing new landed and something went wrong, so there is nothing worth
+            // normalizing or rescanning — and this must not read as success.
+            Logger.LogError(
+                "Album '{AlbumTitle}' downloaded 0 of {Total} tracks ({Failed} failed, {Skipped} already present). "
+                + "Nothing was added to the library.",
+                album.Title, tracksToDownload.Count, failed, skipped);
+            return;
         }
 
         // Final consistency pass: strip every file in the album's folder and rewrite
@@ -619,7 +665,20 @@ public abstract class BaseDownloadService : IDownloadService
             Logger.LogWarning(ex, "Album metadata normalization failed for '{AlbumTitle}'", album.Title);
         }
 
-        Logger.LogInformation("Completed background download for album '{AlbumTitle}'", album.Title);
+        if (failed > 0)
+        {
+            Logger.LogWarning(
+                "Album '{AlbumTitle}' finished incomplete: {Succeeded} downloaded, {Failed} failed, "
+                + "{Skipped} already present, of {Total} tracks. Re-star it to retry the missing tracks.",
+                album.Title, succeeded, failed, skipped, tracksToDownload.Count);
+        }
+        else
+        {
+            Logger.LogInformation(
+                "Completed background download for album '{AlbumTitle}': {Succeeded} downloaded, "
+                + "{Skipped} already present, of {Total} tracks",
+                album.Title, succeeded, skipped, tracksToDownload.Count);
+        }
     }
 
     /// <summary>
@@ -807,6 +866,10 @@ public abstract class BaseDownloadService : IDownloadService
                     if (string.IsNullOrEmpty(song.Label)) song.Label = m.Label;
                     if (string.IsNullOrEmpty(song.ReleaseDate)) song.ReleaseDate = m.ReleaseDate;
                 }
+                else
+                {
+                    Logger.LogWarning("Deezer had no match for '{Artist} - {Title}'; if the file's own Album/AlbumArtist tags are wrong they will be left as-is", song.Artist, queryTitle);
+                }
             }
         }
         catch (Exception ex)
@@ -864,21 +927,34 @@ public abstract class BaseDownloadService : IDownloadService
                 // the client. Since we're the ones assigning the canonical Album
                 // name here, clear the leftover per-file release ids too so every
                 // track in the album groups the same way (by name + album artist).
-                // Empty string, not null: TagLib.Ogg.XiphComment's MusicBrainz setters
-                // throw a NullReferenceException on a literal null (confirmed against
-                // a real FLAC — it crashed every metadata write silently, caught by
-                // the catch below, so tags never got touched at all). Empty string is
-                // the correct "clear this field" value for Xiph comments.
-                tagFile.Tag.MusicBrainzReleaseId = "";
-                tagFile.Tag.MusicBrainzReleaseGroupId = "";
-                tagFile.Tag.MusicBrainzReleaseArtistId = "";
-                // Same story for *SORT fields: Navidrome's album identity also factors
-                // in the album-artist sort name, and a Soulseek upload mixing releases
-                // means some files carry ARTISTSORT/ALBUMARTISTSORT and others don't —
-                // that mismatch alone is enough to split one album into two. Clear the
-                // leftover sort tags so every track in the album agrees (has none).
-                tagFile.Tag.PerformersSort = Array.Empty<string>();
-                tagFile.Tag.AlbumArtistsSort = Array.Empty<string>();
+                // Isolated in its own try/catch: this block only clears secondary
+                // grouping fields (MusicBrainz ids, *SORT tags), it's not essential
+                // like Title/Artist/Album above. A prior bug here (Xiph MusicBrainz
+                // setters throwing NullReferenceException on a literal null — fixed
+                // by using "" instead) silently discarded Title/Artist/Album/Save()
+                // too, because the whole method shared one outer try/catch: one
+                // field throwing meant NOTHING got written and the file kept
+                // whatever wrong tags a Soulseek peer originally baked in (this is
+                // what let the "Awaken, My Love!" tracks keep a totally unrelated
+                // peer's Album/Artist tags). Now a failure here only skips these
+                // secondary fields instead of aborting the whole write.
+                try
+                {
+                    tagFile.Tag.MusicBrainzReleaseId = "";
+                    tagFile.Tag.MusicBrainzReleaseGroupId = "";
+                    tagFile.Tag.MusicBrainzReleaseArtistId = "";
+                    // Same story for *SORT fields: Navidrome's album identity also factors
+                    // in the album-artist sort name, and a Soulseek upload mixing releases
+                    // means some files carry ARTISTSORT/ALBUMARTISTSORT and others don't —
+                    // that mismatch alone is enough to split one album into two. Clear the
+                    // leftover sort tags so every track in the album agrees (has none).
+                    tagFile.Tag.PerformersSort = Array.Empty<string>();
+                    tagFile.Tag.AlbumArtistsSort = Array.Empty<string>();
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning(ex, "Failed to clear MusicBrainz/sort tags on {Path}; Title/Artist/Album were still written", filePath);
+                }
             }
             if (!string.IsNullOrEmpty(song.AlbumArtist))
                 tagFile.Tag.AlbumArtists = new[] { song.AlbumArtist };

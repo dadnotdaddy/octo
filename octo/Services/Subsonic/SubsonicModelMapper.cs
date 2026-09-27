@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
+using Octo.Models.Domain;
 using Octo.Models.Search;
 using Octo.Models.Subsonic;
 
@@ -138,19 +139,31 @@ public class SubsonicModelMapper
         
         // Albums, deduplicated by artist+name so an album you own is not listed twice.
         // Playlists follow, appearing as albums with genre "Playlist".
-        var localAlbumKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Track how many songs the LOCAL copy has, not just that it exists. An album
+        // that only half-downloaded (dead peer, aborted transfer) would otherwise
+        // suppress the external album entirely — and since starring is what completes
+        // an album, hiding the external row made the partial one impossible to finish
+        // from the client. Keep the external entry whenever it offers more tracks.
+        var localAlbumCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var album in localAlbums)
         {
             if (album is not Dictionary<string, object> dict) continue;
             dict.TryGetValue("artist", out var artistObj);
             dict.TryGetValue("name", out var nameObj);
             var key = AlbumKey(artistObj?.ToString(), nameObj?.ToString());
-            if (key is not null) localAlbumKeys.Add(key);
+            if (key is null) continue;
+            dict.TryGetValue("songCount", out var countObj);
+            var count = countObj is null ? 0
+                : int.TryParse(countObj.ToString(), out var parsed) ? parsed : 0;
+            localAlbumCounts[key] = Math.Max(
+                localAlbumCounts.TryGetValue(key, out var prev) ? prev : 0, count);
         }
 
         var mergedAlbums = localAlbums
             .Concat(externalResult.Albums
-                .Where(a => AlbumKey(a.Artist, a.Title) is not string k || !localAlbumKeys.Contains(k))
+                .Where(a => AlbumKey(a.Artist, a.Title) is not string k
+                            || !localAlbumCounts.TryGetValue(k, out var have)
+                            || have < ExternalTrackCount(a))
                 .Select(a => _responseBuilder.ConvertAlbumToJson(a)))
             .Concat(externalPlaylists.Select(p => ConvertPlaylistToAlbumJson(p)))
             .ToList();
@@ -212,19 +225,29 @@ public class SubsonicModelMapper
         }
         
         // Albums, deduplicated by artist+name so an album you own is not listed twice.
-        var localAlbumKeysXml = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Counts, not just presence — see the JSON path above: a half-downloaded
+        // local album must not hide the full external one, or it can never be
+        // completed from the client.
+        var localAlbumCountsXml = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var mergedAlbums = new List<object>();
         foreach (var album in localAlbums.Cast<XElement>())
         {
             var key = AlbumKey(album.Attribute("artist")?.Value, album.Attribute("name")?.Value);
-            if (key is not null) localAlbumKeysXml.Add(key);
+            if (key is not null)
+            {
+                var count = int.TryParse(album.Attribute("songCount")?.Value, out var parsed) ? parsed : 0;
+                localAlbumCountsXml[key] = Math.Max(
+                    localAlbumCountsXml.TryGetValue(key, out var prev) ? prev : 0, count);
+            }
             album.Name = ns + "album";
             mergedAlbums.Add(album);
         }
         foreach (var album in externalResult.Albums)
         {
             var key = AlbumKey(album.Artist, album.Title);
-            if (key is not null && localAlbumKeysXml.Contains(key)) continue;
+            if (key is not null
+                && localAlbumCountsXml.TryGetValue(key, out var have)
+                && have >= ExternalTrackCount(album)) continue;
             mergedAlbums.Add(_responseBuilder.ConvertAlbumToXml(album, ns));
         }
         // Add playlists as albums
@@ -250,6 +273,13 @@ public class SubsonicModelMapper
     
     /// <summary>Dedup key for an album. Null when there is not enough to compare on,
     /// which means "never treat this as a duplicate".</summary>
+    // Mirrors what ConvertAlbumToJson/Xml actually emit as songCount: a search-time
+    // album has an empty Songs list and carries its size in SongCount, while a fully
+    // resolved one has the tracks themselves. Comparing against the wrong one of the
+    // two would read every external album as zero-length and suppress it.
+    private static int ExternalTrackCount(Album album)
+        => album.Songs.Count > 0 ? album.Songs.Count : (album.SongCount ?? 0);
+
     private static string? AlbumKey(string? artist, string? name)
         => string.IsNullOrWhiteSpace(name) ? null : $"{artist?.Trim()}|{name.Trim()}";
 

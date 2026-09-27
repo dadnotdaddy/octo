@@ -189,7 +189,12 @@ public class SoulseekDownloadService : BaseDownloadService
         if (string.IsNullOrEmpty(videoId) && routing.HasArtistTitle)
         {
             var durationHint = await GetOrResolveDurationHintAsync(routing, cancellationToken);
-            var hit = await _youtube.SearchAsync($"{routing.Artist} {routing.Title}", durationHint, cancellationToken);
+            // interactive: someone tapped play and is staring at a spinner. Without
+            // this the resolve queues behind background search enrichment on the
+            // shim's gate — measured at 10-20s of pure wait when the client
+            // refreshes its library at the same time.
+            var hit = await _youtube.SearchAsync(
+                $"{routing.Artist} {routing.Title}", durationHint, cancellationToken, interactive: true);
             videoId = hit?.VideoId;
             // Cache back on the routing so a second click on the same placeholder
             // skips the yt-dlp ytsearch1: round trip — that 3-8s saving is the
@@ -349,6 +354,20 @@ public class SoulseekDownloadService : BaseDownloadService
 
             Logger.LogInformation("Browse of '{Dir}' returned {Total} file(s), {Ranked} usable for '{Title}'",
                 source.Directory, browsed.Count, ranked.Count, routing.Title);
+
+            // A peer that returns nothing has gone offline or stopped sharing. The
+            // cached source is otherwise sticky for the life of the process, so every
+            // remaining track re-asks the same dead peer and the album can never
+            // finish — observed as 30 consecutive empty browses of one username while
+            // both albums sat at 2 of 17 tracks. Drop it so the next track falls back
+            // to a fresh search and can adopt a live peer instead.
+            if (browsed.Count == 0 && albumKey != null)
+            {
+                _albumPreferredPeer.TryRemove(albumKey, out _);
+                Logger.LogInformation(
+                    "Browse of '{Dir}' was empty; forgetting {User} as the source for this album",
+                    source.Directory, source.Username);
+            }
         }
 
         if (ranked.Count == 0)

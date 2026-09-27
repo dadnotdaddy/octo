@@ -48,7 +48,7 @@ public class SoulseekMetadataService : IMusicMetadataService
         return SearchSongsByArtistTitleAsync(queryArtist, queryTitle ?? query, 1);
     }
 
-    public async Task<List<Song>> SearchSongsByArtistTitleAsync(string artist, string title, int limit = 1, int? durationSeconds = null)
+    public async Task<List<Song>> SearchSongsByArtistTitleAsync(string artist, string title, int limit = 1, int? durationSeconds = null, bool resolveDuration = true)
     {
         if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title))
             return new List<Song>();
@@ -58,8 +58,8 @@ public class SoulseekMetadataService : IMusicMetadataService
         // per radio session). YouTube resolution is deferred to /rest/stream where
         // it happens once per actual playback, sequentially as the user advances.
         //
-        // Last.fm's similar-tracks API (our only caller with durationSeconds unset)
-        // never returns a duration. Left unresolved, that used to fall through to a
+        // Last.fm's similar-tracks API never returns a duration, and neither does
+        // its track.search. Left unresolved, that used to fall through to a
         // flat 180s guess with no length verification downstream, which let YouTube
         // matching land on a wrong/long video (e.g. a full-album upload) — the extra
         // runtime after the real song ends was literally the next track(s) in that
@@ -69,7 +69,11 @@ public class SoulseekMetadataService : IMusicMetadataService
         // so resolve the real duration now: it fixes the displayed scrub bar AND
         // gives the later YouTube search a duration hint to match against instead of
         // taking its blind top result.
-        if (durationSeconds is null)
+        // resolveDuration: false means the caller enriches these songs itself right
+        // afterwards. Doing it here too would be the same Deezer call twice, and
+        // this one is on whatever loop the caller is running — serial, if that loop
+        // awaits. That was the whole cost of a Narjo search: 30 round-trips in a row.
+        if (durationSeconds is null && resolveDuration)
         {
             try
             {
@@ -155,10 +159,11 @@ public class SoulseekMetadataService : IMusicMetadataService
     // means playback reuses this exact video (durations match) and it is prewarmed.
     private const int TopDurationResolveLimit = 8;
 
-    public async Task ResolveTopDurationsAsync(List<Song> songs, CancellationToken ct = default)
+    public async Task ResolveTopDurationsAsync(List<Song> songs, CancellationToken ct = default, int? limit = null)
     {
         var sem = new SemaphoreSlim(8);
-        var tasks = songs.Where(s => !s.IsLocal).Take(TopDurationResolveLimit).Select(async song =>
+        var take = limit.GetValueOrDefault(TopDurationResolveLimit);
+        var tasks = songs.Where(s => !s.IsLocal).Take(take).Select(async song =>
         {
             await sem.WaitAsync(ct);
             try
@@ -549,14 +554,23 @@ public class SoulseekMetadataService : IMusicMetadataService
                     topNames = await _deezer.GetArtistTopTrackNamesAsync(primaryHits[0].DeezerId, limit);
             }
         }
-        var songs = new List<Song>(topNames.Count);
-        foreach (var (artist, title) in topNames)
+        // Each resolve is a Deezer round-trip, so run them concurrently rather than
+        // one after another. Select preserves order, so the top-tracks ranking we
+        // just fetched survives.
+        var sem = new SemaphoreSlim(8);
+        var resolved = await Task.WhenAll(topNames.Select(async pair =>
         {
-            var hits = await SearchSongsByArtistTitleAsync(artist, title, 1);
-            if (hits.Count > 0) songs.Add(hits[0]);
-        }
+            await sem.WaitAsync();
+            try
+            {
+                var hits = await SearchSongsByArtistTitleAsync(pair.Item1, pair.Item2, 1);
+                return hits.Count > 0 ? hits[0] : null;
+            }
+            catch { return null; }
+            finally { sem.Release(); }
+        }));
 
-        return songs;
+        return resolved.Where(s => s != null).Cast<Song>().ToList();
     }
 
     // Splits on the common ways a "song artist" credit names more than one act, and
