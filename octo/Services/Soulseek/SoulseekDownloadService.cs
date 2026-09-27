@@ -725,14 +725,39 @@ public class SoulseekDownloadService : BaseDownloadService
     private static bool FilenamePlausiblyMatchesTitle(string filename, string title)
     {
         if (string.IsNullOrEmpty(filename) || string.IsNullOrEmpty(title)) return true;
-        var fn = filename.ToLowerInvariant();
-        var tokens = title.ToLowerInvariant()
-            .Split(new[] { ' ', '-', '(', ')', '[', ']', '_', '.', ',', '\'', '"' },
-                   StringSplitOptions.RemoveEmptyEntries)
-            .Where(t => t.Length >= 3)
-            .ToList();
+
+        // Judge the file's own name only. The full path includes the album folder,
+        // so a track named like its album ("Weaponize Your Rage") matched every file
+        // in that folder, and substring checks let "age" match "Rage". Both sent
+        // "09 - Primitive.flac" in place of tracks 01 and 03.
+        var leaf = filename.Replace('\\', '/');
+        leaf = leaf[(leaf.LastIndexOf('/') + 1)..];
+        var dot = leaf.LastIndexOf('.');
+        if (dot > 0) leaf = leaf[..dot];
+
+        static List<string> Words(string s)
+        {
+            var words = new List<string>();
+            var sb = new System.Text.StringBuilder();
+            foreach (var c in s.ToLowerInvariant())
+            {
+                if (char.IsLetterOrDigit(c)) sb.Append(c);
+                else if (c == '\'') continue;
+                else if (sb.Length > 0) { words.Add(sb.ToString()); sb.Clear(); }
+            }
+            if (sb.Length > 0) words.Add(sb.ToString());
+            return words;
+        }
+
+        var tokens = Words(title).Where(t => t.Length >= 3).Distinct().ToList();
         if (tokens.Count == 0) return true;
-        return tokens.Any(t => fn.Contains(t));
+
+        var leafWords = Words(leaf).ToHashSet();
+        var leafFolded = string.Concat(Words(leaf));
+        // A token counts if it's a whole word in the filename, or (if long enough to
+        // be distinctive) appears inside a run-together name like "NewAgeCannibal".
+        var hits = tokens.Count(t => leafWords.Contains(t) || (t.Length >= 5 && leafFolded.Contains(t)));
+        return hits * 2 >= tokens.Count;
     }
 
     private string? ResolveLocalPath(string remoteFilename, long expectedSize)

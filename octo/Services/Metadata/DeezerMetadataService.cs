@@ -482,6 +482,14 @@ public class DeezerMetadataService
     // ---- iTunes fallback ---------------------------------------------------------------
     private readonly ConcurrentDictionary<string, Lazy<Task<JsonElement?>>> _itunesTasks = new();
 
+    // Apple's search API allows ~20 requests/min per public IP -- shared by every device in
+    // the house. A radio queue enriches up to 50 songs, which got the whole household 403'd.
+    private static readonly SemaphoreSlim _itunesGate = new(1, 1);
+    private static DateTime _itunesNextAllowed = DateTime.MinValue;
+    private static DateTime _itunesBlockedUntil = DateTime.MinValue;
+    private static readonly TimeSpan ItunesSpacing = TimeSpan.FromSeconds(3.3);
+    private sealed class ItunesThrottledException : Exception { }
+
     private static readonly System.Text.RegularExpressions.Regex ItunesCompilation = new(
         @"now that.?s what i call|greatest hits|best of|\bhits\b|collection|anthology|essentials|karaoke|tribute|workout|lullab|originally performed|\bcovers?\b|\bremix(es)?\b|\blive\b|instrumental|\bmix\b",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
@@ -489,6 +497,13 @@ public class DeezerMetadataService
         @"soundtrack|motion picture|original score|\bost\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
     private static readonly System.Text.RegularExpressions.Regex ItunesReissue = new(
         @"deluxe|remaster|anniversary|expanded|edition|bonus", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+    // Marks a different recording/version in a TRACK name ("Yeah (Live)", "... - Radio Edit").
+    // TitleExtras strips these before comparing titles, so they must be penalized separately:
+    // "Usher - Yeah!" matched "Yeah (Live)" (196s) over the 250s original, and the wrong
+    // length made Narjo advance early and overlap the next song.
+    private static readonly System.Text.RegularExpressions.Regex ItunesVersion = new(
+        @"\b(live|remix(ed)?|acoustic|instrumental|karaoke|demo|edit|version|mix|cover|slowed|sped|reverb|remaster(ed)?|mono|a cappella|unplugged)\b",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
     private static readonly System.Text.RegularExpressions.Regex TitleExtras = new(
         @"\s*[\(\[].*?[\)\]]|\s+-\s+.*$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
@@ -511,8 +526,20 @@ public class DeezerMetadataService
     private Task<JsonElement?> ItunesBestAsync(string? artist, string? title, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(title)) return Task.FromResult<JsonElement?>(null);
+        if (DateTime.UtcNow < _itunesBlockedUntil) return Task.FromResult<JsonElement?>(null);
         var key = NormKey(artist) + "|" + NormKey(title);
-        return _itunesTasks.GetOrAdd(key, _ => new Lazy<Task<JsonElement?>>(() => ItunesLookupAsync(artist!, title!, ct))).Value;
+        return CachedItunesAsync(key, artist!, title!, ct);
+    }
+
+    private async Task<JsonElement?> CachedItunesAsync(string key, string artist, string title, CancellationToken ct)
+    {
+        var lazy = _itunesTasks.GetOrAdd(key, _ => new Lazy<Task<JsonElement?>>(() => ItunesLookupAsync(artist, title, ct)));
+        try { return await lazy.Value; }
+        catch (ItunesThrottledException)
+        {
+            _itunesTasks.TryRemove(key, out _);   // not an answer -- retry later, don't cache "no match"
+            return null;
+        }
     }
 
     private async Task<JsonElement?> ItunesLookupAsync(string artist, string title, CancellationToken ct)
@@ -520,8 +547,26 @@ public class DeezerMetadataService
         try
         {
             var term = Uri.EscapeDataString($"{artist} {title}");
-            using var doc = await GetJsonAsync($"https://itunes.apple.com/search?term={term}&entity=song&limit=25&country=US", ct);
-            if (doc is null || !doc.RootElement.TryGetProperty("results", out var res) || res.ValueKind != JsonValueKind.Array)
+            if (!await _itunesGate.WaitAsync(TimeSpan.FromSeconds(10), ct)) throw new ItunesThrottledException();
+            string body;
+            try
+            {
+                var wait = _itunesNextAllowed - DateTime.UtcNow;
+                if (wait > TimeSpan.Zero) await Task.Delay(wait, ct);
+                _itunesNextAllowed = DateTime.UtcNow + ItunesSpacing;
+                using var resp = await Client().GetAsync($"https://itunes.apple.com/search?term={term}&entity=song&limit=25&country=US", ct);
+                if ((int)resp.StatusCode is 403 or 429)
+                {
+                    _itunesBlockedUntil = DateTime.UtcNow.AddSeconds(90);
+                    _logger.LogWarning("iTunes rate-limited us (HTTP {Code}); pausing iTunes lookups for 90s", (int)resp.StatusCode);
+                    throw new ItunesThrottledException();
+                }
+                if (!resp.IsSuccessStatusCode) throw new ItunesThrottledException();
+                body = await resp.Content.ReadAsStringAsync(ct);
+            }
+            finally { _itunesGate.Release(); }
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("results", out var res) || res.ValueKind != JsonValueKind.Array)
                 return null;
             var wantArtist = NormKey(artist);
             var wantTitle = NormKey(TitleExtras.Replace(title, ""));
@@ -536,6 +581,9 @@ public class DeezerMetadataService
                 if (NormKey(TitleExtras.Replace(Str(r, "trackName") ?? "", "")) != wantTitle) continue;
                 var coll = Str(r, "collectionName") ?? "";
                 var penalty = 0;
+                var trackName = Str(r, "trackName") ?? "";
+                foreach (System.Text.RegularExpressions.Match m in ItunesVersion.Matches(trackName))
+                    if (!title.Contains(m.Value, StringComparison.OrdinalIgnoreCase)) { penalty += m.Value.ToLowerInvariant().StartsWith("remaster") ? 1 : 12; break; }
                 if (NormKey(Str(r, "collectionArtistName")) == "variousartists") penalty += 10;
                 if (ItunesCompilation.IsMatch(coll) && !ItunesCompilation.IsMatch(title)) penalty += 8;
                 if (ItunesSoundtrack.IsMatch(coll) && !wantSoundtrack) penalty += 6;
@@ -552,10 +600,11 @@ public class DeezerMetadataService
                 _logger.LogInformation("iTunes match for '{A} - {T}': {Album}", artist, title, Str(best.Value, "collectionName"));
             return best;
         }
+        catch (ItunesThrottledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogDebug("itunes lookup '{A} - {T}' failed: {M}", artist, title, ex.Message);
-            return null;
+            throw new ItunesThrottledException();   // transient: don't cache as "no match"
         }
     }
 
