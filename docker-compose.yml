@@ -10,6 +10,11 @@ services:
       - "5274:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Production
+      # Octo logs at Information; the framework's per-request HttpClient/ASP.NET chatter
+      # (~70% of all lines) only at Warning.
+      Logging__LogLevel__Default: Information
+      Logging__LogLevel__System.Net.Http: Warning
+      Logging__LogLevel__Microsoft.AspNetCore: Warning
 
       # ----- Subsonic / Navidrome upstream -----
       # Required. Your Navidrome server, reachable from THIS container (a LAN IP

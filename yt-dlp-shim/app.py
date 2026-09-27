@@ -62,6 +62,41 @@ _AUDIO_FORMAT = os.environ.get(
 # from a 3-8s yt-dlp invocation to a dict lookup. Bounded so we never grow
 # without limit. The cache is best-effort; restarts wipe it.
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+
+# In-process yt-dlp for the quick metadata/URL lookups. Spawning a fresh yt-dlp
+# process per call re-pays Python + plugin import + player-JS/nsig warm-up every
+# time (~0.9s bare startup): a search went 2.0s -> 1.0s and a stream-URL resolve
+# 3.0s -> 1.2-1.8s in-process, with identical results (same ids/order, same itag).
+# Downloads stay out-of-process. YTDLP_INPROCESS=0 restores the old behaviour.
+try:
+    import yt_dlp as _yt_dlp
+except Exception:  # module missing: everything falls back to the subprocess path
+    _yt_dlp = None
+_INPROCESS = os.environ.get("YTDLP_INPROCESS", "1") != "0" and _yt_dlp is not None
+_INPROCESS_LABELS = {"search+resolve", "search5", "meta5", "meta", "resolve"}
+_INPROCESS_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("MAX_CONCURRENT_YTDLP", "5")) + 2,
+                                     thread_name_prefix="ytdlp")
+
+if _yt_dlp is not None:
+    class _CaptureYDL(_yt_dlp.YoutubeDL):
+        """Collects what the CLI would print (--print / -g) instead of writing to the
+        process-wide stdout, so concurrent calls can't interleave output."""
+        def __init__(self, params):
+            super().__init__(params)
+            self.captured = []
+
+        def to_stdout(self, message, skip_eol=False, quiet=None):
+            self.captured.append(message)
+
+
+def _run_inprocess(argv: list[str]) -> tuple[int, str]:
+    # parse_options turns the exact CLI argv into YoutubeDL params, so cookies, the
+    # PO-token extractor args, format and print templates behave identically.
+    _, _, urls, opts = _yt_dlp.parse_options(argv)
+    with _CaptureYDL(opts) as ydl:
+        rc = ydl.download(urls)
+        return rc, "\n".join(ydl.captured) + ("\n" if ydl.captured else "")
 _SEARCH_CACHE_LOCK = threading.Lock()
 _SEARCH_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 _SEARCH_CACHE_MAX = int(os.environ.get("SEARCH_CACHE_MAX", "1024"))
@@ -186,6 +221,23 @@ def _run(args: list[str], timeout: int = 20, label: str = "ytdlp",
         pot_args = ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_BASE_URL}"]
         full = [YTDLP, "--no-warnings", "--no-playlist", *cookie_args, *pot_args, *args]
         t_run = time.monotonic()
+        if _INPROCESS and label in _INPROCESS_LABELS:
+            fut = _INPROCESS_POOL.submit(_run_inprocess, full[1:])
+            try:
+                rc, out = fut.result(timeout=timeout)
+                wall_ms = (time.monotonic() - t_run) * 1000.0
+                log.info("ytdlp label=%s prio=%s gate_wait_ms=%.0f wall_ms=%.0f rc=%d inproc=1",
+                         label, "interactive" if interactive else "bg", gate_ms, wall_ms, rc)
+                return out if rc == 0 else None
+            except _FutureTimeout:
+                log.warning("yt-dlp in-process timed out (%s, gate_wait_ms=%.0f): %s", label, gate_ms, " ".join(args))
+                return None
+            except Exception as e:  # e.g. DownloadError: same outcome as a non-zero exit
+                if isinstance(e, getattr(_yt_dlp.utils, "DownloadError", ())) or isinstance(e, SystemExit):
+                    log.warning("yt-dlp in-process error (%s): %s", label, str(e)[:300])
+                    return None
+                log.warning("yt-dlp in-process crashed (%s): %r; retrying as a subprocess", label, e)
+                t_run = time.monotonic()
         try:
             cp = subprocess.run(
                 full,

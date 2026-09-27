@@ -11,7 +11,8 @@ RUN dotnet restore
 COPY octo/ octo/
 COPY octo.Tests/ octo.Tests/
 
-RUN dotnet publish octo/octo.csproj -c Release -o /app/publish
+# ReadyToRun: precompiled IL, so the first requests after a restart skip JIT.
+RUN dotnet publish octo/octo.csproj -c Release -o /app/publish -r linux-x64 --self-contained false -p:PublishReadyToRun=true
 
 # Runtime stage
 FROM mcr.microsoft.com/dotnet/aspnet:9.0
