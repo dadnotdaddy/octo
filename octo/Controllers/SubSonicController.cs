@@ -2020,9 +2020,14 @@ public class SubsonicController : ControllerBase
                 var videoId = routing.YouTubeId;
                 if (string.IsNullOrEmpty(videoId))
                 {
+                    // No known length = no way to verify the pick; the play path resolves
+                    // one from Deezer first. Caching a blind pick here is what made the
+                    // play path reuse a double-length video.
+                    if (routing.Duration is not int known || known <= 0) return;
                     var hit = await _youtube.SearchAsync(
                         $"{routing.Artist} {routing.Title}", routing.Duration, cts.Token);
-                    videoId = hit?.VideoId;
+                    if (hit is null || !YouTubeHit.Fits(hit.Duration, known)) return;
+                    videoId = hit.VideoId;
                     if (!string.IsNullOrEmpty(videoId)) routing.YouTubeId = videoId;
                 }
                 if (string.IsNullOrEmpty(videoId)) return;

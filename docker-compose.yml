@@ -2,6 +2,7 @@ services:
   octorr:
     build: .
     container_name: octorr
+    user: "1000:1000"  # same as slskd; library + config are owned by bryson
     extra_hosts:
       - "${TAILNET_HOST}:${HOST_LAN_IP}"
     restart: unless-stopped

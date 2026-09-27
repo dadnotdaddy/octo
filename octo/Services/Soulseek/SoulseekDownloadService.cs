@@ -125,7 +125,15 @@ public class SoulseekDownloadService : BaseDownloadService
     protected override void EnsureRoutingRegistered(Song track)
     {
         if (string.IsNullOrEmpty(track.ExternalId)) return;
-        if (_idRegistry.Lookup(track.ExternalId) is not null) return;
+        var existing = _idRegistry.Lookup(track.ExternalId);
+        if (existing is not null)
+        {
+            // Album downloads re-resolve each track one by one, which drops the album's
+            // artist; keep it on the shared routing so the file is filed under the album.
+            if (string.IsNullOrEmpty(existing.AlbumArtist) && !string.IsNullOrEmpty(track.AlbumArtist))
+                existing.AlbumArtist = track.AlbumArtist;
+            return;
+        }
 
         _idRegistry.Register(new SoulseekRouting
         {
@@ -133,6 +141,7 @@ public class SoulseekDownloadService : BaseDownloadService
             Artist = track.Artist,
             Title = track.Title,
             Album = track.Album,
+            AlbumArtist = track.AlbumArtist,
             Duration = track.Duration,
             Track = track.Track,
             DiscNumber = track.DiscNumber,
@@ -545,7 +554,11 @@ public class SoulseekDownloadService : BaseDownloadService
     private string BuildOrganizedPath(SoulseekRouting routing, string artist, string title, string ext)
     {
         var album = string.IsNullOrWhiteSpace(routing.Album) ? title : routing.Album!;
-        return PathHelper.BuildTrackPath(DownloadPath, artist, album, title, routing.Track, ext);
+        // Folder by ALBUM artist: a soundtrack's tracks all belong in
+        // "Various Artists/<album>", not one folder per performer. Identical for
+        // ordinary albums, where album artist == track artist.
+        var folderArtist = SanitizeForFs(routing.AlbumArtist) ?? artist;
+        return PathHelper.BuildTrackPath(DownloadPath, folderArtist, album, title, routing.Track, ext);
     }
 
     private static string? SanitizeForFs(string? s)

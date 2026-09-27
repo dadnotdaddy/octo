@@ -172,8 +172,13 @@ public class SoulseekMetadataService : IMusicMetadataService
                 // Deezer duration as a hint so it picks the closest-length canonical
                 // video (not a long-form/compilation upload); playback reuses the
                 // stored videoId, so the shown length matches the audio.
+                // Without a known length there is nothing to verify a pick against, and a
+                // blind top result is exactly how a full-album / runs-into-next-track upload
+                // got stored as "the" video for a song. Leave those for the play path.
+                if (song.Duration is not int known || known <= 0) return;
                 var hit = await _youtube.MetaAsync($"{song.Artist} {song.Title}", song.Duration, ct);
-                if (hit is { VideoId.Length: > 0 } && hit.Duration is int d && d > 0)
+                if (hit is { VideoId.Length: > 0 } && hit.Duration is int d && d > 0
+                    && YouTubeHit.Fits(d, known))
                 {
                     song.Duration = d;
                     var routing = _idRegistry.Lookup(song.Id);
@@ -237,8 +242,9 @@ public class SoulseekMetadataService : IMusicMetadataService
             {
                 var routing = t.routing!;
                 if (!string.IsNullOrEmpty(routing.YouTubeId)) return;
+                if (routing.Duration is not int known || known <= 0) return; // unverifiable: leave to play path
                 var hit = await _youtube.SearchAsync($"{routing.Artist} {routing.Title}", routing.Duration, ct);
-                if (hit is { VideoId: { Length: > 0 } })
+                if (hit is { VideoId: { Length: > 0 } } && YouTubeHit.Fits(hit.Duration, known))
                 {
                     routing.YouTubeId = hit.VideoId;
                     if (hit.Duration is int d) routing.Duration = d;
@@ -415,6 +421,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 Artist = track.Artist,
                 Title = track.Title,
                 Album = detail.Title,
+                AlbumArtist = detail.Artist,
                 Duration = track.Duration,
                 Track = track.TrackPosition,
                 DiscNumber = track.DiscNumber,
@@ -673,6 +680,9 @@ public class SoulseekRouting
     public string? Artist { get; set; }
     public string? Title { get; set; }
     public string? Album { get; set; }
+    /// <summary>The album's artist ("Various Artists" on a soundtrack), used for the
+    /// library folder so a compilation lands in one album folder, not one per performer.</summary>
+    public string? AlbumArtist { get; set; }
     public int? Duration { get; set; }
 
     /// <summary>Deezer album id, when an album search resolved one. Absent on album

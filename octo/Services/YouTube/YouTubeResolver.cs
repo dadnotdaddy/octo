@@ -218,5 +218,15 @@ public class YouTubeHit
     public string VideoId { get; set; } = "";
     public string? Title { get; set; }
     public int? Duration { get; set; }
+
+    /// <summary>
+    /// True when a YouTube video's length is plausibly the same recording as a track of
+    /// <paramref name="expectedSeconds"/>: within 25% or 30s. Different uploads of one song
+    /// differ by tens of seconds ("Fade" 3:13 on Deezer vs 3:45 on YouTube), but a
+    /// full-album upload or a video that runs into the next track is far outside that.
+    /// </summary>
+    public static bool Fits(int? videoSeconds, int? expectedSeconds)
+        => videoSeconds is int v && v > 0 && expectedSeconds is int e && e > 0
+           && Math.Abs(v - e) <= Math.Max(30, e / 4);
     public string? Channel { get; set; }
 }

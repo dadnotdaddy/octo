@@ -43,6 +43,11 @@ public abstract class BaseDownloadService : IDownloadService
     // guarded and the only unguarded reader was dead code; enabling album downloads makes
     // that pattern live, and concurrent read+write on Dictionary is undefined.
     protected readonly ConcurrentDictionary<string, DownloadInfo> ActiveDownloads = new();
+
+    // Album artist per track id, set by the album job. DownloadSongInternalAsync
+    // re-resolves each track on its own (Track mode), which yields per-track metadata
+    // whose AlbumArtist is the performer — wrong for compilations.
+    private readonly ConcurrentDictionary<string, string> _albumArtistOverrides = new();
     // Was new(1, 1) -- one download at a time system-wide regardless of available
     // bandwidth. Raised to allow several tracks (even across different albums) to
     // transfer concurrently; still bounded so a handful of slow/stalled peers can't
@@ -395,6 +400,12 @@ public abstract class BaseDownloadService : IDownloadService
                 throw new Exception("Song not found");
             }
 
+            if (_albumArtistOverrides.TryGetValue(externalId, out var albumArtistOverride)
+                && !string.IsNullOrEmpty(albumArtistOverride))
+            {
+                song.AlbumArtist = albumArtistOverride;
+            }
+
             var downloadInfo = new DownloadInfo
             {
                 SongId = songId,
@@ -571,6 +582,11 @@ public abstract class BaseDownloadService : IDownloadService
 
             try
             {
+                if (!string.IsNullOrEmpty(album.Artist))
+                {
+                    track.AlbumArtist = album.Artist;
+                    _albumArtistOverrides[track.ExternalId!] = album.Artist;
+                }
                 EnsureRoutingRegistered(track);
 
                 var existingPath = await LocalLibraryService.GetLocalPathForExternalSongAsync(ProviderName, track.ExternalId!);
@@ -657,6 +673,7 @@ public abstract class BaseDownloadService : IDownloadService
                 DownloadPath,
                 PathHelper.SanitizeFolderName(albumArtist),
                 PathHelper.SanitizeFolderName(album.Title));
+            await MoveTrackIntoAlbumFolderAsync(excludeTrackExternalId, album, albumFolder);
             await NormalizeAlbumMetadataAsync(albumFolder, albumArtist, album.Title, CancellationToken.None);
             await LocalLibraryService.TriggerLibraryScanAsync(force: true);
         }
@@ -678,6 +695,49 @@ public abstract class BaseDownloadService : IDownloadService
                 "Completed background download for album '{AlbumTitle}': {Succeeded} downloaded, "
                 + "{Skipped} already present, of {Total} tracks",
                 album.Title, succeeded, skipped, tracksToDownload.Count);
+        }
+    }
+
+    /// <summary>
+    /// The starred track is downloaded before its album job exists, so it was filed by
+    /// its own artist. On a compilation that is a different folder from the album's,
+    /// and the normalize pass (which only scans the album folder) would skip it.
+    /// </summary>
+    private async Task MoveTrackIntoAlbumFolderAsync(string trackExternalId, Album album, string albumFolder)
+    {
+        try
+        {
+            var current = await LocalLibraryService.GetLocalPathForExternalSongAsync(ProviderName, trackExternalId);
+            if (string.IsNullOrEmpty(current) || !IOFile.Exists(current)) return;
+            var currentDir = Path.GetDirectoryName(Path.GetFullPath(current))!;
+            var targetDir = Path.GetFullPath(albumFolder).TrimEnd(Path.DirectorySeparatorChar);
+            if (string.Equals(currentDir, targetDir, StringComparison.OrdinalIgnoreCase)) return;
+
+            Directory.CreateDirectory(targetDir);
+            var target = Path.Combine(targetDir, Path.GetFileName(current));
+            if (IOFile.Exists(target)) return;
+            IOFile.Move(current, target);
+
+            var song = album.Songs.FirstOrDefault(s => s.ExternalId == trackExternalId);
+            if (song != null)
+            {
+                song.LocalPath = target;
+                await LocalLibraryService.RegisterDownloadedSongAsync(song, target);
+            }
+
+            var root = Path.GetFullPath(DownloadPath).TrimEnd(Path.DirectorySeparatorChar);
+            var dir = currentDir;
+            while (dir.Length > root.Length && dir.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+                   && Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+            {
+                Directory.Delete(dir);
+                dir = Path.GetDirectoryName(dir)!;
+            }
+            Logger.LogInformation("Moved starred track into the album folder: {From} -> {To}", current, target);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not move the starred track into the album folder '{Folder}'", albumFolder);
         }
     }
 

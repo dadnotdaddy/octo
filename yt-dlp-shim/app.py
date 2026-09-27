@@ -241,7 +241,8 @@ def search():
     if not payload.get("video_id"):
         return jsonify(error="no_hit"), 404
 
-    _cache_put(cache_key, payload)
+    if payload.get("fits", True):  # never cache a pick that failed the length check
+        _cache_put(cache_key, payload)
     return jsonify(**payload)
 
 
@@ -297,39 +298,56 @@ def _search_single(q: str, interactive: bool = False) -> Optional[dict]:
     return payload
 
 
+def _fits(duration, hint) -> bool:
+    """Same recording? Within 25% or 30s of the expected length. Different uploads of
+    one song differ by tens of seconds; a full-album upload or a video that runs into
+    the next track (the "double length" bug) is far outside that."""
+    return bool(duration) and bool(hint) and abs(duration - hint) <= max(30, hint // 4)
+
+
+def _flat_candidates(query: str, n: int, label: str, interactive: bool) -> list:
+    out = _run([f"ytsearch{n}:{query}", "--flat-playlist", "--print", "%(.{id,title,duration,channel})j"],
+               timeout=20, label=label, interactive=interactive)
+    cands = []
+    for ln in (out or "").strip().split("\n"):
+        ln = ln.strip()
+        if ln:
+            try:
+                cands.append(json.loads(ln))
+            except json.JSONDecodeError:
+                pass
+    return cands
+
+
+def _pick_fitting(q: str, duration_hint: int, label: str, interactive: bool):
+    """(best_candidate, fits). Prefer a candidate whose length fits the hint; if none of
+    the top 5 does, retry with "audio" appended (official audio uploads rarely carry
+    extra runtime). Only as a last resort return the closest non-fitting one."""
+    seen = []
+    for query, n in ((q, 5), (f"{q} audio", 8)):
+        cands = _flat_candidates(query, n, label, interactive)
+        seen += cands
+        fitting = sorted((c for c in cands if _fits(c.get("duration"), duration_hint)),
+                         key=lambda c: abs(c["duration"] - duration_hint))
+        if fitting:
+            return fitting[0], True
+    if not seen:
+        return None, False
+    seen.sort(key=lambda r: abs((r.get("duration") or 0) - duration_hint) if r.get("duration") else float("inf"))
+    log.warning("no length match for %r (want ~%ss); closest is %ss %s",
+                q, duration_hint, seen[0].get("duration"), seen[0].get("id"))
+    return seen[0], False
+
+
 def _search_with_hint(q: str, duration_hint: int, interactive: bool = False) -> Optional[dict]:
     """Duration hint present: pick the closest-length of 5 flat candidates
     (cheap, no per-video extraction), then resolve the winner's URL once."""
-    out = _run(
-        [
-            f"ytsearch5:{q}",
-            "--flat-playlist",
-            "--print", "%(.{id,title,duration,channel})j",
-        ],
-        timeout=20,
-        label="search5",
-        interactive=interactive,
-    )
-    if out is None:
-        return None
-    candidates = []
-    for ln in out.strip().split("\n"):
-        ln = ln.strip()
-        if not ln:
-            continue
-        try:
-            candidates.append(json.loads(ln))
-        except json.JSONDecodeError:
-            pass
-    if not candidates:
+    best, fits = _pick_fitting(q, duration_hint, "search5", interactive)
+    if best is None:
         return {}
-    # Closest duration wins; candidates without a duration sort last so a hint
-    # never drags us onto an entry we can't length-match.
-    candidates.sort(
-        key=lambda r: abs((r.get("duration") or 0) - duration_hint)
-        if r.get("duration") else float("inf")
-    )
+    candidates = [best]
     payload = _payload_from(candidates[0])
+    payload["fits"] = fits
     if payload.get("video_id"):
         # Warm the URL cache for the coming /stream (single-flight + cached).
         # Inherits the caller's priority: on the playback path this resolve is
@@ -423,35 +441,26 @@ def meta():
 
     key = _norm_q(q)
     # Hot front: exact repeat within this process.
+    # A cached row is only reused if it fits the length being asked for: rows used to be
+    # stored from blind top-1 picks, and one bad pick then served that song forever.
     with _META_CACHE_LOCK:
         c = _META_CACHE.get(key)
-        if c is not None:
+        if c is not None and (duration_hint is None or _fits(c.get("duration"), duration_hint)):
             _META_CACHE.move_to_end(key)
             return jsonify(**c)
     # Durable backing: resolved in a past search/warm, possibly a past process.
     persisted = _meta_db_get(key)
-    if persisted is not None:
+    if persisted is not None and (duration_hint is None or _fits(persisted.get("duration"), duration_hint)):
         with _META_CACHE_LOCK:
             _META_CACHE[key] = persisted
             _META_CACHE.move_to_end(key)
         return jsonify(**persisted)
 
+    verified = False
     if duration_hint is not None:
-        out = _run([f"ytsearch5:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
-                   timeout=20, label="meta5", interactive=interactive)
-        cands = []
-        for ln in (out or "").strip().split("\n"):
-            ln = ln.strip()
-            if ln:
-                try:
-                    cands.append(json.loads(ln))
-                except json.JSONDecodeError:
-                    pass
-        if not cands:
+        data, verified = _pick_fitting(q, duration_hint, "meta5", interactive)
+        if data is None:
             return jsonify(error="no_hit"), 404
-        cands.sort(key=lambda r: abs((r.get("duration") or 0) - duration_hint)
-                   if r.get("duration") else float("inf"))
-        data = cands[0]
     else:
         out = _run([f"ytsearch1:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
                    timeout=15, label="meta", interactive=interactive)
@@ -472,7 +481,8 @@ def meta():
             _META_CACHE.move_to_end(key)
             while len(_META_CACHE) > _SEARCH_CACHE_MAX:
                 _META_CACHE.popitem(last=False)
-        _meta_db_put(key, payload)  # persist so it survives restarts, for both modes
+        if verified:  # persist only length-verified picks; a blind top-1 is not "the" video
+            _meta_db_put(key, payload)
     return jsonify(**payload)
 
 
