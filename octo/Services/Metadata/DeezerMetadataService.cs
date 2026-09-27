@@ -102,6 +102,12 @@ public class DeezerMetadataService
             _logger.LogDebug("deezer enrich track '{A} - {T}' failed: {M}", artist, title, ex.Message);
         }
 
+        // Deezer's `artist:"x" track:"y"` search returns nothing for every query (since
+        // 2026-09), which left duration hints at a blind 180s. Fall back to iTunes.
+        if (meta is null && await ItunesBestAsync(artist, title, ct) is JsonElement it)
+            meta = new TrackMeta(Str(it, "collectionName"), ItunesArt(it), includeYear ? ItunesYear(it) : null,
+                ItunesSeconds(it), Str(it, "artistName"), null);
+
         return meta;
     }
 
@@ -158,6 +164,16 @@ public class DeezerMetadataService
         catch (Exception ex)
         {
             _logger.LogDebug("deezer full enrich '{A} - {T}' failed: {M}", artist, title, ex.Message);
+        }
+
+        // Same Deezer outage silently disabled all download tagging (files kept whatever the
+        // uploader tagged, e.g. "Yesterday" filed under "The Slow Rush"). iTunes fallback.
+        if (meta is null && await ItunesBestAsync(artist, title, ct) is JsonElement it)
+        {
+            var rd = Str(it, "releaseDate");
+            meta = new FullTrackMeta(Str(it, "collectionName"), ItunesArt(it), ItunesYear(it), ItunesSeconds(it),
+                Str(it, "artistName"), Int(it, "trackNumber"), Int(it, "discNumber"), null, Int(it, "trackCount"),
+                Str(it, "primaryGenreName"), null, rd is { Length: >= 10 } ? rd[..10] : rd);
         }
 
         return meta;
@@ -461,6 +477,86 @@ public class DeezerMetadataService
         catch { /* best-effort */ }
         _albumYearTasks.TryRemove(albumId, out _);
         return year;
+    }
+
+    // ---- iTunes fallback ---------------------------------------------------------------
+    private readonly ConcurrentDictionary<string, Lazy<Task<JsonElement?>>> _itunesTasks = new();
+
+    private static readonly System.Text.RegularExpressions.Regex ItunesCompilation = new(
+        @"now that.?s what i call|greatest hits|best of|\bhits\b|collection|anthology|essentials|karaoke|tribute|workout|lullab|originally performed|\bcovers?\b|\bremix(es)?\b|\blive\b|instrumental|\bmix\b",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex ItunesSoundtrack = new(
+        @"soundtrack|motion picture|original score|\bost\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex ItunesReissue = new(
+        @"deluxe|remaster|anniversary|expanded|edition|bonus", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex TitleExtras = new(
+        @"\s*[\(\[].*?[\)\]]|\s+-\s+.*$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static string NormKey(string? s) => new string((s ?? "").ToLowerInvariant()
+        .Normalize(System.Text.NormalizationForm.FormD).Where(char.IsLetterOrDigit).ToArray());
+
+    private static string? ItunesArt(JsonElement it)
+        => Str(it, "artworkUrl100")?.Replace("100x100bb", "1400x1400bb");
+    private static int? ItunesYear(JsonElement it)
+        => Str(it, "releaseDate") is { Length: >= 4 } d && int.TryParse(d[..4], out var y) ? y : null;
+    private static int? ItunesSeconds(JsonElement it)
+        => it.TryGetProperty("trackTimeMillis", out var ms) && ms.ValueKind == JsonValueKind.Number ? (int)(ms.GetInt64() / 1000) : null;
+
+    /// <summary>
+    /// Best iTunes song for (artist, title): artist and title (minus "(feat..)"/" - Remastered")
+    /// must match; prefers the original album over compilations (collectionArtistName
+    /// "Various Artists" or compilation-like titles), soundtracks, singles/EPs and reissues;
+    /// earliest release wins ties. Null when nothing matches -> file tags are left as-is.
+    /// </summary>
+    private Task<JsonElement?> ItunesBestAsync(string? artist, string? title, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(title)) return Task.FromResult<JsonElement?>(null);
+        var key = NormKey(artist) + "|" + NormKey(title);
+        return _itunesTasks.GetOrAdd(key, _ => new Lazy<Task<JsonElement?>>(() => ItunesLookupAsync(artist!, title!, ct))).Value;
+    }
+
+    private async Task<JsonElement?> ItunesLookupAsync(string artist, string title, CancellationToken ct)
+    {
+        try
+        {
+            var term = Uri.EscapeDataString($"{artist} {title}");
+            using var doc = await GetJsonAsync($"https://itunes.apple.com/search?term={term}&entity=song&limit=25&country=US", ct);
+            if (doc is null || !doc.RootElement.TryGetProperty("results", out var res) || res.ValueKind != JsonValueKind.Array)
+                return null;
+            var wantArtist = NormKey(artist);
+            var wantTitle = NormKey(TitleExtras.Replace(title, ""));
+            var wantSoundtrack = ItunesSoundtrack.IsMatch(title);
+            JsonElement? best = null;
+            (int penalty, string date) bestKey = (int.MaxValue, "9999");
+            foreach (var r in res.EnumerateArray())
+            {
+                var candArtist = NormKey(Str(r, "artistName"));
+                if (candArtist.Length == 0 || !(candArtist == wantArtist || candArtist.StartsWith(wantArtist) || wantArtist.StartsWith(candArtist)))
+                    continue;
+                if (NormKey(TitleExtras.Replace(Str(r, "trackName") ?? "", "")) != wantTitle) continue;
+                var coll = Str(r, "collectionName") ?? "";
+                var penalty = 0;
+                if (NormKey(Str(r, "collectionArtistName")) == "variousartists") penalty += 10;
+                if (ItunesCompilation.IsMatch(coll) && !ItunesCompilation.IsMatch(title)) penalty += 8;
+                if (ItunesSoundtrack.IsMatch(coll) && !wantSoundtrack) penalty += 6;
+                if (coll.EndsWith(" - Single") || coll.EndsWith(" - EP")) penalty += 3;
+                if (ItunesReissue.IsMatch(coll)) penalty += 1;
+                var key = (penalty, Str(r, "releaseDate") ?? "9999");
+                if (key.Item1 < bestKey.penalty || (key.Item1 == bestKey.penalty && string.CompareOrdinal(key.Item2, bestKey.date) < 0))
+                {
+                    bestKey = key;
+                    best = r.Clone();
+                }
+            }
+            if (best is not null)
+                _logger.LogInformation("iTunes match for '{A} - {T}': {Album}", artist, title, Str(best.Value, "collectionName"));
+            return best;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("itunes lookup '{A} - {T}' failed: {M}", artist, title, ex.Message);
+            return null;
+        }
     }
 
     private async Task<JsonDocument?> GetJsonAsync(string url, CancellationToken ct)
