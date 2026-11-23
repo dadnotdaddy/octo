@@ -84,3 +84,6 @@ slskd-state/
 *.bak
 *.bak[0-9]
 *.bak-*
+
+# Python bytecode
+__pycache__/
